@@ -1,6 +1,32 @@
 import pytest
-from utils import density_matrix, kraus, System, operator
 import numpy as np
+import jax.numpy as jnp
+from utils import Operator, density_matrix, kraus, System, operator
+
+
+
+@pytest.fixture
+def U():
+    return operator([[0,1],[-1,0]])
+
+
+
+def operator_data_type(U):
+    
+    assert U.find_data_type() == 'numpy'
+    U = operator(jnp.array([[0,1],[-1,0]]))
+    assert operator.find_data_type() == 'jax' 
+
+def test_multiplication(U):
+    U2 = U * U
+    assert U2.shape == (2,2)
+    assert U2 == operator(-1 * np.identity(2))
+
+def test_tensor(U):
+    U2 = U.tensor(operator(np.identity(2)))
+    assert U2.shape == (4,4)
+    assert U2 == operator([[0,0,1,0],[0,0,0,1],[-1,0,0,0],[0,-1,0,0]])
+
 def test_partial_trace():
     np.random.seed(0)
     a = density_matrix(np.random.rand(2))

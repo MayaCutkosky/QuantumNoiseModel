@@ -1,49 +1,157 @@
 import numpy as np
 def operator(x):
     n = len(x)
-    M = Operator((n,n),complex, buffer= np.array(x, dtype = complex))
+    M = Operator([n,n], buffer= np.array(x, dtype = complex))
     return M
 def kraus(x):
-    x = np.array(x, dtype = complex)
-    M = Kraus(x.shape,complex, buffer= x)
+    M = Kraus(buffer= x)
     return M
 
-class Operator(np.ndarray):
-    def __new__(cls, *args, **kwargs):
-        instance = super().__new__(cls, *args, **kwargs)
-        return instance
+
+
+class Operator:
+    def __init__(self, shape = [2,2], dtype = complex, buffer = None, data_object = None):
+        self.type = "operator"
+        if data_object is None:
+            if buffer is None:
+                self.data_object = "numpy"
+            else:
+                self.data_object = self.find_data_type(buffer)
+                if self.data_object is None:
+                    self.data_object = "numpy"
+        
+        if self.data_object == 'jax':
+            if buffer is None:
+                self.data = jnp.zeros(shape, dtype = dtype)
+            else:
+                self.data = jnp.array(buffer, dtype = dtype)
+        elif self.data_object == 'numpy':
+            self.data = np.array(buffer, dtype = dtype)
+        else:
+            Exception("Not understood data type:", data_object)
+        self.shape = self.data.shape
+        if self.data_object == 'jax':
+            self.np = jnp
+        else:
+            self.np = np
+    
+    def find_data_type(self, data = None):
+        if data is None:
+            data = self.data
+        data_object = str(type(data))
+        if "numpy" in data_object:
+            return "numpy"
+        elif "jax" in data_object:
+            return "jax"
+        return None
+
+    def _create_new(self, **kwargs):
+        output = self.__new__(type(self))
+        output.__init__(**kwargs)
+        return output
+
     def __mul__(self,y):
         if isinstance(y, Operator):
-            return np.matmul(self,y)
+            data = self.np.matmul(self.data,y.data)
         else:
-            return super().__mul__(y)
+            data = self.data * y
+        
+        return self._create_new(buffer = data)
+    
+    def _replace_binary_method(self,fun_name,y):
+        fun = getattr(self.data, fun_name)
+        if isinstance(y, Operator):
+            data = fun(y.data)
+        else:
+            data = fun(y)
+        return self._create_new(buffer = data)
+
+    def __sub__(self,y):
+        return self._replace_binary_method("__sub__", y)
+
+
+    def __add__(self, y):
+        return self._replace_binary_method('__add__', y)
+
+    def __truediv__(self, y):
+        #Better not to use division for operator and operator. Only sensible interpretation is multiply by inverse which is less confusing to just code. Could use for constants though. And this is used later.
+        if isinstance(y, Operator):
+            return Exception('Operator-Operator division not allowed. Use Operator * Operator.adjoint()' )
+        else:
+            return self._create_new(buffer = self.data / y )
+        
+    def __floordiv__(self, y): #don't actually see myself using this...
+        if isinstance(y, Operator):
+            return Exception('Operator-Operator division not allowed. Use Operator * Operator.adjoint()' )
+        else:
+            return self._create_new(buffer = self.data // y )
+
     def tensor(self, y):
-        return np.kron(self,y)
+        if isinstance(y, Operator):
+            y = y.data
+        data = self.np.kron(self.data,y)
+        return self._create_new(buffer = data)
 
     def adjoint(self):
-        return np.swapaxes(np.conj(self),-1,-2)
+        data = self.np.swapaxes(self.np.conj(self.data),-1,-2)
+        return self._create_new(buffer = data)
 
     def is_unitary(self):
         return self * self.adjoint() == np.identity(len(self))
 
     def __eq__(self,x):
-      return np.max(self - x) < 1e-10
+        if isinstance(x, list):
+            for xi, yi in zip(x, self):
+                if not yi == xi:
+                    return False
+            return True
+        if isinstance(x, Operator):
+            x = x.data
+        return self.np.max(np.abs(self.data - x)) < 1e-10
+        
+    def __len__(self):
+        return len(self.data)
+        
+    def __getitem__(self,i):
+        return self._create_new(buffer = self.data[i])
+    def __setitem__(self, i, value):
+        if isinstance(value, Operator):
+            self.data[i] = value.data
+        else:
+            self.data[i] = self.np.array(value)
+    def __iter__(self):
+        for x in self.data:
+            yield self._create_new(buffer = x)
 
+    def _replace_numpy_method(self,fun_name,*args, **kwargs):
+        fun = getattr(self.np,fun_name)
+        data = fun(self.data, *args, **kwargs)
+        return self._create_new(buffer = data)
+    
+    def sum(self):
+        return _replace_numpy_method('sum')
+    
+    def __str__(self):
+        return str(self.data)
+    def __repr__(self):
+        return self.type + '(' + str(self.data) + ')'
 
 class Kraus(Operator):
-    pass
+    def __init__(self, shape = [1,2,2], *args, **kwargs):
+        super().__init__(shape, *args, **kwargs)
+        self.type = 'kraus'
 
 class DensityMatrix(Operator): #allow for list of DensityMatrices
     def transition(self,U : Operator):
         is_Kraus = isinstance(U,Kraus)
         if is_Kraus and len(U.shape) > 3:
-            U = np.swapaxes(U,0,-3)
-        output = U * self * U.adjoint()
-        if isinstance(U, Kraus):
+            U.data = self.np.swapaxes(U.data,0,-3)
+        output = self._create_new(buffer = (U * self * U.adjoint()).data)
+        if is_Kraus:
             if len(U.shape) > 3:
-                output = density_matrix(np.swapaxes(output,0,-3))
+                output.data = self.np.swapaxes(output.data,0,-3)
             output = output.sum(axis = -3)
-        return density_matrix(output)
+        return output
 
     def partial_trace(self, i):
         #shape : s, i,j
@@ -59,7 +167,7 @@ class DensityMatrix(Operator): #allow for list of DensityMatrices
         return self[...,i1,j1] + self[...,i2,j2]
 
     def measure(self, psi):
-        output = np.matmul(np.matmul([psi], rho),psi)
+        output = self.np.matmul(self.np.matmul([psi], rho),psi)
         assert output.imag == 0
         return output.real[0]
 
@@ -137,5 +245,5 @@ ideal_gates = {
 }
 cz = np.identity(4)
 cz[3,3] = -1
-ideal_gates['cz'] = cz
+ideal_gates['cz'] = operator(cz)
 
