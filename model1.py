@@ -10,6 +10,7 @@ import pickle
 
 class Model:
     def __init__(self, backend = None, config = None):
+        self.circuit_calculation = 'only_used_qubits'
         if config is not None:
             self.load_config(config)
             self.optim = optax.adam(1e-3)
@@ -20,8 +21,10 @@ class Model:
                 self.connections,
                 self.error_operators,
                 self.readout_err,
-            ) = process_backend(backend)
+            ) = process_backend(backend.properties())
+            self.backend = backend
             self.initialize_params()
+            
             self.optim = optax.adam(1e-3)
             self.opt_state = self.optim.init(self.cross_talk_probabilities)
         self.represented_terms = ['num_qubits', 'connections', 'error_operators', 'readout_err', 'cross_talk_probabilities']
@@ -31,31 +34,52 @@ class Model:
     def initialize_params(self):
         self.cross_talk_probabilities = np.random.rand( len(self.connections), len(self.connections)-1) / 100
         self.cross_talk_probabilities = jnp.array(self.cross_talk_probabilities.T)
-    def _run_instruction(self, sys, instruction, cross_talk_prob_params):
+    def _run_instruction(self, sys, instruction, used_qubits, cross_talk_prob_params):
         gate_type, qubit_ids, params = instruction
+        if self.circuit_calculation == 'only_used_qubits':
+            sys_qubit_ids = []
+            for q in qubit_ids:
+                sys_qubit_ids.append(used_qubits.index(q))
+        else:
+            sys_qubit_ids = qubit_ids
         if gate_type == 'rz':
             ideal_operator = ideal_gates[gate_type](params[0])
         else:
             ideal_operator = ideal_gates[gate_type]
-        sys.transition(self.error_operators[gate_type][qubit_ids]['relax'])
-        sys.transition_qubit(self.error_operators[gate_type][qubit_ids]['depol'] * ideal_operator, qubit_ids)
+        sys.transition(self.error_operators[gate_type][qubit_ids]['relax'][used_qubits])
+        sys.transition_qubit(self.error_operators[gate_type][qubit_ids]['depol'] * ideal_operator, sys_qubit_ids)
         if len(qubit_ids) < 2:
             return sys
         probs = cross_talk_prob_params[self.connections.index(qubit_ids)]
         cross_talk_operator = (1 - probs.sum()) * kraus([np.identity(4)], data_object = 'jax')
         for i, (cross_talk_qubits, err_operator) in enumerate(self.error_operators[gate_type].items()):
-            p = probs[i]
-            cross_talk_operator.extend(p * err_operator['depol'] * ideal_gates['cz'])
+            if cross_talk_qubits[0] in used_qubits and cross_talk_qubits[1] in used_qubits:
+                p = probs[i]
+                cross_talk_operator.extend(p * err_operator['depol'] * ideal_gates['cz'])
         sys.transition_qubit(cross_talk_operator, cross_talk_qubits)
         return sys
+            
+            
 
-    def run(self, circuit, readout_qubits) -> np.ndarray:
-        return self._run(circuit, readout_qubits, self.cross_talk_probabilities)
-    def _run(self, circuit, readout_qubits, params):
-        sys = System(self.num_qubits, data_object = 'jax')
+    def run(self, circuit, readout_qubits, used_qubits = None) -> np.ndarray:
+        return self._run(circuit, readout_qubits, used_qubits, self.cross_talk_probabilities)
+    def _run(self, circuit, readout_qubits, used_qubits, params):
+        if self.circuit_calculation == 'exact':
+            sys = System(self.num_qubits, data_object='jax')
+        elif self.circuit_calculation == 'only_used_qubits':
+            for q in list(used_qubits):
+                for qn in self.backend.coupling_map.neighbors(q):
+                    if qn not in used_qubits:
+                        used_qubits.append(qn)
+
+            sys = System(len(used_qubits), data_object = 'jax')
+
+
         for instruction in circuit:
-            sys = self._run_instruction(sys, instruction, params)
-
+            sys = self._run_instruction(sys, instruction, used_qubits, params)
+        
+        if self.circuit_calculation == 'only_used_qubits':
+            readout_qubits =  np.array([used_qubits.index(q) for q in readout_qubits])
         readout_probs = [
             sys.rho(readout_qubits,0,0) * (1 - self.readout_err[readout_qubits,0]) + sys.rho(readout_qubits,1,1) * self.readout_err[readout_qubits,1],
             sys.rho(readout_qubits,0,0) * self.readout_err[readout_qubits,0] + sys.rho(readout_qubits,1,1) * (1 - self.readout_err[readout_qubits,1])
@@ -65,9 +89,9 @@ class Model:
 
     def _calculate_loss(self, sample, params):
 
-        circuit, readout_qubits, exp_readout = sample
+        circuit, readout_qubits, used_qubits, exp_readout = sample
 
-        readout_probs = self._run(circuit, readout_qubits, params)
+        readout_probs = self._run(circuit, readout_qubits, used_qubits,  params)
         log_readout_probs = jnp.log(readout_probs + 1e-8) #deal with prob = 0
         binary_conversion_inds = np.arange(len(readout_qubits)), np.array([list(np.binary_repr(i, width=len(readout_qubits))) for i in range(2**len(readout_qubits))], dtype=int)
         log_pred_readout = jnp.sum(log_readout_probs[binary_conversion_inds],axis = 1)

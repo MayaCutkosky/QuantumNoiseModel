@@ -119,12 +119,15 @@ class Dataset:
     def translate_circuit(circuit):
         circ = []
         measurement_gate_inds = dict()
+        used_qubits = set()
         for i, inst in enumerate(circuit):
             if inst.name == 'measure':
                 measurement_gate_inds[inst.clbits[0]._index] = inst.qubits[0]._index
             if inst.name in ['barrier','measure']:
                 continue
             qubits = tuple([q._index for q in inst.qubits])
+            for q in qubits:
+                used_qubits.add(q)
             if len(qubits) == 2:
                 if qubits[0] > qubits[1]:
                     qubits = (qubits[1], qubits[0])
@@ -132,10 +135,9 @@ class Dataset:
         readout_qubits = np.empty(len(measurement_gate_inds), dtype = int)
         for ind, val in measurement_gate_inds.items():
             readout_qubits[ind] = val
-        return circ, readout_qubits
+        return circ, readout_qubits, list(used_qubits)
     
     @staticmethod
-    
     def translate_job_measurements(job_measurements, num_readout_qubits):
         readout_values = [ int(i, 2) for i in job_measurements.keys() ]
         exp_readout = np.zeros(2**num_readout_qubits)
@@ -145,10 +147,10 @@ class Dataset:
     def __getitem__(self, i):
         d = self.data_dicts[i]
         #somehow load data
-        circuit, readout_qubits =  self.translate_circuit(self.load_circuit(d['filename'])[0])
+        circuit, readout_qubits, used_qubits =  self.translate_circuit(self.load_circuit(d['filename'])[0])
         exp_readout = self.translate_job_measurements(d['job_measurements'], len(readout_qubits))
         
-        return circuit, readout_qubits, exp_readout
+        return circuit, readout_qubits, used_qubits, exp_readout
         
     def __len__(self):
         return len(self.data_dict)
