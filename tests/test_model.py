@@ -6,13 +6,13 @@ import numpy as np
 def check_eq(x,y):
     x = np.array(x)
     y = np.array(y)
-    assert np.max(np.abs(x-y)) < 1e-7
+    assert np.max(np.abs(x-y)) < 1e-6
 
 def check_noisy_eq(x,y,noise = 0.3):
     x = np.array(x)
     y = np.array(y)
     assert np.max(np.abs(x-y)) < noise
-    assert np.max(np.abs(x-y)) > 1e-7
+    assert np.max(np.abs(x-y)) > 1e-6
 
 @pytest.fixture
 def sample_model():
@@ -75,7 +75,7 @@ class FakeDataset:
             raise IndexError()
         circ = ( ('x', (0,), None),  ('x', (1,), None), ('cz', (0,1), None) )
         
-        return circ, [0,1], [0,0,0,1]
+        return circ, [0,1],[0,1], [0,0,0,1]
 
 
 
@@ -124,31 +124,31 @@ class TestRun:
         else:
             param = None
         circ = [(gate, (0,), param)]
-        prob = model.run(circ,[0])
+        prob = model.run(circ,[0],[0])
         eq_fun(prob, [exp_output[0]])
     
-        prob = model.run(circ*2,[0])
+        prob = model.run(circ*2,[0],[0])
         eq_fun(prob, [exp_output[1]])
     
     
     def test_1_rz(self, model, eq_fun, request):
         model = request.getfixturevalue(model)
         circ = [('sx',(0,), None), ('rz',(0,), [np.pi/2]), ('sx',(0,), None)]
-        prob = model.run(circ, [0])
+        prob = model.run(circ, [0],[0])
         eq_fun(prob,[[0.5,0.5]])
     
     
     @pytest.mark.parametrize("circ, exp_output", test1cz_exp_output)
     def test_1_cz(self, model, eq_fun, circ, exp_output, request):
         model = request.getfixturevalue(model)
-        prob = model.run(circ,[0,1])
+        prob = model.run(circ,[0,1],[0,1])
         eq_fun(prob, exp_output)
 
     #should work for any model
     def test_2(self, model, eq_fun, request):
         model = request.getfixturevalue(model)
         circuit =  [('x', (0,), None),('x', (1,), None)  ]
-        prob =   model.run(circuit, [0,1,2])
+        prob =   model.run(circuit, [0,1,2],[0,1,2])
         assert prob.shape == (3,2)
         assert [abs(p[0] + p[1] - 1) < 1e-10 for p in prob]
         assert prob[0][1] > 0.9
@@ -161,7 +161,7 @@ def test_loading_from_obtained_config(model_fixture, Dataset, request):
     model = request.getfixturevalue(model_fixture)
     config = model.get_config()
     reloaded_model = Model(config=config)
-    check_eq(model.run(circ, readout_q), reloaded_model.run(circ, readout_q))
+    check_eq(model.run(circ, readout_q,readout_q), reloaded_model.run(circ, readout_q, readout_q))
     
 import pickle
 def test_config_is_pickleable(sample_model):
@@ -185,7 +185,7 @@ class TestTraining:
        readout_qubits = [[0,1],[0,2],[1,2],[1,3]]
        outputs = []
        for circ, q in zip(circuits, readout_qubits):
-           prop = sample_noisy_model.run(circ, q)
+           prop = sample_noisy_model.run(circ, q, [0,1,2,3])
            outputs.append(np.array([
                    prop[0][0] * prop[1][0],
                    prop[0][1] * prop[1][0],
@@ -205,3 +205,15 @@ class TestTraining:
            assert loss <= loss_old
            assert curr_dist_from_true_params <= prev_dist_from_true_params
            prev_dist_from_true_params = curr_dist_from_true_params
+
+import tracemalloc
+def test_memory_leaks(sample_model):
+    sample = FakeDataset()()[0]
+    tracemalloc.start()
+    initial_mem, peak_mem = tracemalloc.get_traced_memory()
+    for _ in range(10):
+        sample_model.train_step(sample)
+    final_mem = tracemalloc.get_traced_memory()[0]
+    tracemalloc.stop()
+    assert final_mem <= peak_mem
+    

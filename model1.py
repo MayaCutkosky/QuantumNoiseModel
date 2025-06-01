@@ -4,9 +4,8 @@ from jax import value_and_grad
 import json
 from data import process_backend
 import numpy as np
-from utils import operator, System, ideal_gates, kraus
+from utils import operator, System, ideal_gates, kraus, DensityMatrix, softmax
 import pickle
-
 
 class Model:
     def __init__(self, backend = None, config = None):
@@ -32,8 +31,11 @@ class Model:
         self.grad_fun = value_and_grad(self._calculate_loss, argnums = 1)
         
     def initialize_params(self):
-        self.cross_talk_probabilities = np.random.rand( len(self.connections), len(self.connections)-1) / 100
-        self.cross_talk_probabilities = jnp.array(self.cross_talk_probabilities.T)
+        r = np.random.rand( len(self.connections), len(self.connections)) / self.num_qubits / 10
+        r[np.arange(len(self.connections)), np.arange(len(self.connections))] = 0        
+        self.cross_talk_probabilities = np.diag(1 - r.sum(axis = 1)) + r
+        self.cross_talk_probabilities = jnp.array(self.cross_talk_probabilities)
+        
     def _run_instruction(self, sys, instruction, used_qubits, cross_talk_prob_params):
         gate_type, qubit_ids, params = instruction
         if self.circuit_calculation == 'only_used_qubits':
@@ -50,13 +52,20 @@ class Model:
         sys.transition_qubit(self.error_operators[gate_type][qubit_ids]['depol'] * ideal_operator, sys_qubit_ids)
         if len(qubit_ids) < 2:
             return sys
+        
+        #$\\rho^{(1)} = (1 - \\sum_{g' \\in G} p_{g,g'}) C_g R_T \\rho^{(0)} R_T^\\dagger C_g^{\\dagger} + \\sum_{g' \\in G}  p_{g,g'} C_{g'}C_g R_T \\rho^{(0)} R_T^\\dagger (C_gC_{g'})^{\\dagger}  $
         probs = cross_talk_prob_params[self.connections.index(qubit_ids)]
-        cross_talk_operator = (1 - probs.sum()) * kraus([np.identity(4)], data_object = 'jax')
+        rho = DensityMatrix(buffer = sys.rho) * (1 - probs.sum())
+        sys.careful_mode = False
         for i, (cross_talk_qubits, err_operator) in enumerate(self.error_operators[gate_type].items()):
+            if cross_talk_qubits == qubit_ids:
+                continue
             if cross_talk_qubits[0] in used_qubits and cross_talk_qubits[1] in used_qubits:
                 p = probs[i]
-                cross_talk_operator.extend(p * err_operator['depol'] * ideal_gates['cz'])
-        sys.transition_qubit(cross_talk_operator, cross_talk_qubits)
+                operator =  err_operator['depol'] * ideal_gates['cz']
+                rho +=sys.transition_qubit(operator, cross_talk_qubits, in_place = False) * p
+
+        sys.rho = rho
         return sys
             
             
@@ -87,7 +96,15 @@ class Model:
         readout_probs = jnp.transpose(jnp.array(readout_probs))
         return readout_probs.real
 
+    @staticmethod
+    def normalize_params(params):
+        exp_x = jnp.exp(params).T
+        return (exp_x / exp_x.sum(0)).T
+        
+        
     def _calculate_loss(self, sample, params):
+        
+        params = self.normalize_params(params)
 
         circuit, readout_qubits, used_qubits, exp_readout = sample
 
@@ -95,7 +112,7 @@ class Model:
         log_readout_probs = jnp.log(readout_probs + 1e-8) #deal with prob = 0
         binary_conversion_inds = np.arange(len(readout_qubits)), np.array([list(np.binary_repr(i, width=len(readout_qubits))) for i in range(2**len(readout_qubits))], dtype=int)
         log_pred_readout = jnp.sum(log_readout_probs[binary_conversion_inds],axis = 1)
-        loss = - np.sum(jnp.array(exp_readout) * log_pred_readout)
+        loss = - np.sum(jnp.array(exp_readout) * log_pred_readout) 
         return loss
 
     def calculate_loss(self, sample):
@@ -115,13 +132,13 @@ class Model:
         loss : jnp.array
 
         '''
-        return self._calculate_loss(sample, self.cross_talk_probabilities)
+        return self._calculate_loss(sample, self.cross_talk_probabilities) 
 
     def train_step(self, sample):
-        loss, grad = self.grad_fun(sample, self.cross_talk_probabilities)
+        loss, grad = self.grad_fun(sample, self.cross_talk_probabilities )
         updates, self.opt_state = self.optim.update( grad , self.opt_state )
         self.cross_talk_probabilities = optax.apply_updates(self.cross_talk_probabilities, updates)
-        return loss
+        return loss 
 
     def get_config(self): #Not json serializable object, but can always pickle 
         config = {

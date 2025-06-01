@@ -121,13 +121,13 @@ class Dataset:
         measurement_gate_inds = dict()
         used_qubits = set()
         for i, inst in enumerate(circuit):
+            qubits = tuple([q._index for q in inst.qubits])
+            for q in qubits:
+                used_qubits.add(q)
             if inst.name == 'measure':
                 measurement_gate_inds[inst.clbits[0]._index] = inst.qubits[0]._index
             if inst.name in ['barrier','measure']:
                 continue
-            qubits = tuple([q._index for q in inst.qubits])
-            for q in qubits:
-                used_qubits.add(q)
             if len(qubits) == 2:
                 if qubits[0] > qubits[1]:
                     qubits = (qubits[1], qubits[0])

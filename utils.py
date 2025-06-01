@@ -256,10 +256,10 @@ class System:
             for key, value in config.items():
                 setattr(self, key, value)
     def transition_qubit(self,U, qubits, in_place = True):
-        if not in_place:
-            sys = System(self.config())
-            sys.transition_qubit(self, U, qubits)
-            return sys
+        if in_place:
+            rho = self.rho
+        else:
+            rho = DensityMatrix(buffer = self.rho)
         if self.careful_mode:
             assert U.is_unitary
             assert U.shape[-1] == U.shape[-2]
@@ -267,15 +267,16 @@ class System:
 
         if len(qubits) == 1:
             i = qubits[0]
-            self.rho[i] = self.rho[i].transition(U)
+            rho[i] = rho[i].transition(U)
 
         elif len(qubits) == 2:
             i,j = qubits
-            combined_rho = self.rho[i].tensor(self.rho[j])
+            combined_rho = rho[i].tensor(rho[j])
             combined_rho = combined_rho.transition(U)
-            self.rho[i] = combined_rho.partial_trace(1)
-            self.rho[j] = combined_rho.partial_trace(0)
+            rho[i] = combined_rho.partial_trace(1)
+            rho[j] = combined_rho.partial_trace(0)
             
+        return rho
 
 
     def transition(self, U, in_place = True):
@@ -314,3 +315,9 @@ cz = np.identity(4)
 cz[3,3] = -1
 ideal_gates['cz'] = operator(cz)
 
+def sigmoid(x):
+    return 1 / ( 1 + np.exp(-x))
+
+def softmax(x,axis = None):
+    exp_x = np.exp(x)
+    return exp_x / exp_x.sum(axis = axis)
