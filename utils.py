@@ -79,7 +79,6 @@ class Operator:
                 data = self.np.matmul(self._data,y._data)
         else:
             data = self._data * y
-
         return self._create_new(buffer = data)
 
     def __rmul__(self, y):
@@ -289,7 +288,6 @@ class System:
             return sys
         self.rho = self.rho.transition(U)
 
-
 import itertools as it
 pauli = {
     'I' : operator(np.identity(2)),
@@ -321,3 +319,41 @@ def sigmoid(x):
 def softmax(x,axis = None):
     exp_x = np.exp(x)
     return exp_x / exp_x.sum(axis = axis)
+
+def find_neighboring_qubits(q, coupling_map, distance = 1, return_close_neighbors = False):
+    close_neighbors = []
+    if isinstance(q, int):
+        curr_dist_neighbors = [q]
+    else:
+        curr_dist_neighbors = q
+
+    for i in range(distance):
+        close_neighbors += list(curr_dist_neighbors)
+        next_dist_neighbors = set()
+        for q_neigh in curr_dist_neighbors:
+            for q_far_neigh in coupling_map[q_neigh]:
+                if q_far_neigh not in close_neighbors:
+                    next_dist_neighbors.add(q_far_neigh)
+        curr_dist_neighbors = next_dist_neighbors
+    if return_close_neighbors:
+        return curr_dist_neighbors, close_neighbors
+    else:
+        return curr_dist_neighbors
+
+
+def add_gate(circuit, used_qubits, coupling_map, distance = 1):
+    possible_qubits, near_qubits = find_neighboring_qubits(used_qubits, coupling_map, distance, True)
+    for q1 in np.random.permutation(list(possible_qubits)):
+        q1 = int(q1)
+        for q2 in np.random.permutation(list(coupling_map[q1])):
+            q2 = int(q2)
+            if q2 in near_qubits:
+                continue
+            if q1 > q2:
+                new_gate = ('cz',(q2,q1), None)
+            else:
+                new_gate = ('cz', (q1,q2), None)
+            break
+    circuit.insert(np.random.randint(len(circuit)), new_gate)
+    used_qubits + [q1,q2]
+    return circuit, used_qubits

@@ -26,12 +26,19 @@ class Model:
             
             self.optim = optax.adam(1e-3)
             self.opt_state = self.optim.init(self.cross_talk_probabilities)
-        self.represented_terms = ['num_qubits', 'connections', 'error_operators', 'readout_err', 'cross_talk_probabilities']
+        self.represented_terms = ['num_qubits', 'connections', 'cross_talk_probabilities']
         
         self.grad_fun = value_and_grad(self._calculate_loss, argnums = 1)
         
+        self.coupling_map = dict()
+        for q1, q2 in self.connections:
+            self.coupling_map.setdefault(q1, set() )
+            self.coupling_map.setdefault(q2, set() )
+            self.coupling_map[q2].add(q1)
+            self.coupling_map[q1].add(q2)
+
     def initialize_params(self):
-        r = np.random.rand( len(self.connections), len(self.connections)) / self.num_qubits / 10
+        r = np.random.rand( len(self.connections), len(self.connections)) / self.num_qubits / 100
         r[np.arange(len(self.connections)), np.arange(len(self.connections))] = 0        
         self.cross_talk_probabilities = np.diag(1 - r.sum(axis = 1)) + r
         self.cross_talk_probabilities = jnp.array(self.cross_talk_probabilities)
@@ -77,7 +84,7 @@ class Model:
             sys = System(self.num_qubits, data_object='jax')
         elif self.circuit_calculation == 'only_used_qubits':
             for q in list(used_qubits):
-                for qn in self.backend.coupling_map.neighbors(q):
+                for qn in self.coupling_map[q]:
                     if qn not in used_qubits:
                         used_qubits.append(qn)
 
@@ -113,7 +120,10 @@ class Model:
         binary_conversion_inds = np.arange(len(readout_qubits)), np.array([list(np.binary_repr(i, width=len(readout_qubits))) for i in range(2**len(readout_qubits))], dtype=int)
         log_pred_readout = jnp.sum(log_readout_probs[binary_conversion_inds],axis = 1)
         loss = - np.sum(jnp.array(exp_readout) * log_pred_readout) 
-        return loss
+        
+        cross_talk_probs = params.at[np.arange(len(params)), np.arange(len(params))].subtract(params[np.arange(len(params)), np.arange(len(params))])
+
+        return loss + jnp.exp(cross_talk_probs).sum()
 
     def calculate_loss(self, sample):
         '''

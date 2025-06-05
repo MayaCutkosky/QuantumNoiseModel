@@ -13,7 +13,7 @@ def relaxation_error(prop, qubit, gate_length):
 
     p_reset = 1 - np.exp(-gate_length /t1)
     exp_t2 = np.exp(-gate_length / t2)
-    if p_reset - 1 < 1e-12 or exp_t2 < 1e-12:
+    if 1 - p_reset < 1e-12 or exp_t2 < 1e-12:
         return [np.identity(2)]
     err = qiskit_Kraus(Choi(
                 np.array(
@@ -26,14 +26,14 @@ def relaxation_error(prop, qubit, gate_length):
                 )
             ))
     err = err.data
-    err.extend([np.identity(2)]*(3-len(err)))
+    #err.extend([np.identity(2)]*(3-len(err)))
     return err
 
 def gate_error(gate_err, relax_err, num_qubits):
     relax_fid = average_gate_fidelity(relax_err)
     dim = 2 ** num_qubits
     depol_param = dim * (gate_err + relax_fid - 1) / (dim * relax_fid - 1)
-    return depol_param / 4 ** num_qubits
+    return depol_param / (4 ** num_qubits)
 
 def process_gate_data(g):
   gate_length = None
@@ -49,6 +49,8 @@ def process_gate_data(g):
 
 def get_errs_from_gate(prop, g):
     name, qubits, gate_err, gate_length = process_gate_data(g)
+    if qubits[0] == 32 and name == 'cz':
+        print(gate_err)
     relax_errs = []
     for q in range(len(prop.qubits)):
         relax_errs.append(relaxation_error(prop, q, gate_length))
@@ -66,8 +68,10 @@ def get_errs_from_gate(prop, g):
         pauli_err = operator([1])
         for key in key_list:
             pauli_err = pauli_err.tensor(pauli[key])
-        kraus_input.append(depol_err * pauli_err)
-    kraus_input.append((1-len(kraus_input)*depol_err) * np.identity(2**len(qubits)))
+        kraus_input.append(np.sqrt(depol_err).tolist() * pauli_err)
+    if 1 - len(kraus_input)*depol_err < 0:
+        print(depol_err, len(kraus_input), gate_err, average_gate_fidelity(relax_gate_err),name, qubits)
+    kraus_input.append(np.sqrt(1-len(kraus_input)*depol_err).tolist() * np.identity(2**len(qubits)))
     return kraus(relax_errs), kraus(kraus_input)
 
 def get_readout_errs(q):
@@ -104,6 +108,7 @@ def process_backend(prop):
 
 import json
 import qiskit
+from qiskit import qpy
 class Dataset:
     def __init__(self, filename):
         self.data_dir = filename.rpartition('/')[0]
@@ -153,7 +158,7 @@ class Dataset:
         return circuit, readout_qubits, used_qubits, exp_readout
         
     def __len__(self):
-        return len(self.data_dict)
+        return len(self.data_dicts)
 
 
 
