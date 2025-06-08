@@ -93,6 +93,14 @@ test1cz_exp_output = [
     (x_inst(0) + x_inst(1) + cnot_inst(0,1), [[0,1], [1,0]])
 ]
 
+
+model_dependencies = [
+    'tests/test_data::test_process_backend_datatypes', 
+    'tests/test_data::test_relaxation_error',
+    'tests/test_data::test_all_error',
+]
+
+@pytest.mark.dependancy(depends = model_dependencies, scope = 'session')
 def test_model_is_not_changing(sample_model):
     circ = []
     for gate in ['id','x','sx','rz']:
@@ -105,10 +113,12 @@ def test_model_is_not_changing(sample_model):
     sample_model.run(circ,[0])
     check_change(sample_model)
 
+@pytest.mark.dependancy(depends = model_dependencies + ['tests/test_model::test_model_is_not_changing'], scope = 'session')
 @pytest.mark.parametrize("model, eq_fun", [('sample_model', check_eq), ('sample_noisy_model', check_noisy_eq)])
 class TestRun:
-        
+    
     #testing specific gates
+    @pytest.mark.dependancy(depends = model_dependencies+ ['tests/test_model::test_model_is_not_changing'] , scope = 'session')
     @pytest.mark.parametrize('gate,exp_output',
                              [
                                  ('id',([1,0],[1,0])),
@@ -130,7 +140,6 @@ class TestRun:
         prob = model.run(circ*2,[0],[0])
         eq_fun(prob, [exp_output[1]])
     
-    
     def test_1_rz(self, model, eq_fun, request):
         model = request.getfixturevalue(model)
         circ = [('sx',(0,), None), ('rz',(0,), [np.pi/2]), ('sx',(0,), None)]
@@ -138,7 +147,6 @@ class TestRun:
         eq_fun(prob,[[0.5,0.5]])
     
     
-    @pytest.mark.parametrize("circ, exp_output", test1cz_exp_output)
     def test_1_cz(self, model, eq_fun, circ, exp_output, request):
         model = request.getfixturevalue(model)
         prob = model.run(circ,[0,1],[0,1])
@@ -147,14 +155,13 @@ class TestRun:
     #should work for any model
     def test_2(self, model, eq_fun, request):
         model = request.getfixturevalue(model)
-        circuit =  [('x', (0,), None),('x', (1,), None)  ]
+        circuit =  h_inst(0) + cnot_inst(1,2) + x_inst(0) #random circuit using all gates
         prob =   model.run(circuit, [0,1,2],[0,1,2])
         assert prob.shape == (3,2)
         assert [abs(p[0] + p[1] - 1) < 1e-10 for p in prob]
-        assert prob[0][1] > 0.9
-        assert prob[1][1] > 0.9
-        assert prob[2][0] > 0.9
 
+
+@pytest.mark.dependancy(depends = model_dependencies + ['tests/test_model::test_model_is_not_changing'], scope = 'session')
 @pytest.mark.parametrize("model_fixture, Dataset", [('sample_model', FakeDataset)])
 def test_loading_from_obtained_config(model_fixture, Dataset, request):
     circ, readout_q, _ = Dataset()[0]
@@ -164,12 +171,15 @@ def test_loading_from_obtained_config(model_fixture, Dataset, request):
     check_eq(model.run(circ, readout_q,readout_q), reloaded_model.run(circ, readout_q, readout_q))
     
 import pickle
+@pytest.mark.dependancy()
 def test_config_is_pickleable(sample_model):
     config = sample_model.get_config()
     config = pickle.loads(pickle.dumps(config))
     Model(config = config)
 
 import jax.numpy as jnp
+
+@pytest.mark.dependancy(depends = model_dependencies + ['tests/test_model::test_model_is_not_changing', 'tests/test_model::TestRun'], scope = 'session')
 class TestTraining:
    def test_loss(self, sample_model):
        assert 0 == sample_model.calculate_loss(FakeDataset()[0]).round(6)

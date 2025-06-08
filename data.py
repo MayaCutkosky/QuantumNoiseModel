@@ -26,12 +26,16 @@ def relaxation_error(prop, qubit, gate_length):
                 )
             ))
     err = err.data
-    #err.extend([np.identity(2)]*(3-len(err)))
+    err.extend([np.identity(2)] * (3 - len(err)))
     return err
 
 def gate_error(gate_err, relax_err, num_qubits):
     relax_fid = average_gate_fidelity(relax_err)
     dim = 2 ** num_qubits
+    
+    max_gate_err = dim / (dim + 1)
+    gate_err = min(gate_err, max_gate_err)
+    
     depol_param = dim * (gate_err + relax_fid - 1) / (dim * relax_fid - 1)
     return depol_param / (4 ** num_qubits)
 
@@ -69,9 +73,8 @@ def get_errs_from_gate(prop, g):
         for key in key_list:
             pauli_err = pauli_err.tensor(pauli[key])
         kraus_input.append(np.sqrt(depol_err).tolist() * pauli_err)
-    if 1 - len(kraus_input)*depol_err < 0:
-        print(depol_err, len(kraus_input), gate_err, average_gate_fidelity(relax_gate_err),name, qubits)
     kraus_input.append(np.sqrt(1-len(kraus_input)*depol_err).tolist() * np.identity(2**len(qubits)))
+
     return kraus(relax_errs), kraus(kraus_input)
 
 def get_readout_errs(q):
