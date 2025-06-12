@@ -11,18 +11,18 @@ def U():
 
 @pytest.mark.dependency(name = 'operator')
 class Test_operator:
-    def test_operator_data_type(U):
+    def test_operator_data_type(self,U):
         
         assert U.find_data_type() == 'numpy'
-        U = operator(jnp.array([[0,1],[-1,0]]))
-        assert operator.find_data_type() == 'jax' 
+        U2 = operator([[0,1],[-1,0]], data_object = 'jax')
+        assert U2.find_data_type() == 'jax' 
     
-    def test_multiplication(U):
+    def test_multiplication(self,U):
         U2 = U * U
         assert U2.shape == (2,2)
         assert U2 == operator(-1 * np.identity(2))
     
-    def test_tensor(U):
+    def test_tensor(self,U):
         U2 = U.tensor(operator(np.identity(2)))
         assert U2.shape == (4,4)
         assert U2 == operator([[0,0,1,0],[0,0,0,1],[-1,0,0,0],[0,-1,0,0]])
@@ -30,24 +30,24 @@ class Test_operator:
 @pytest.mark.dependency(name = 'Kraus')
 class Test_Kraus:
     
-    def test_kraus_multiplication():
+    def test_kraus_multiplication(self):
         np.random.seed(0)
         U = kraus(np.random.rand(3,2,2))
         rho = density_matrix(np.random.rand(2))
         assert U * rho == [u * rho for u in U]
     
-    def test_is_Kraus_function_true():
+    def test_is_Kraus_function_true(self):
         K = kraus([pauli['X']*0.5, pauli['Y']*0.5, pauli['Z'] * 0.5, pauli['I'] * 0.5])
         assert K.is_Kraus()
     
-    def test_is_Kraus_function_false():
+    def test_is_Kraus_function_false(self):
         K = kraus([pauli['X']*0.5, pauli['Y']*0.5, pauli['Z'] * 0.5, pauli['I'] * 0.5])
         assert K.is_Kraus()
 
 
 @pytest.mark.dependency(name = 'DensityMatrix')
 class Test_DensityMatrix:
-    def test_partial_trace():
+    def test_partial_trace(self):
         np.random.seed(0)
         a = density_matrix(np.random.rand(2))
         b = density_matrix(np.random.rand(2))

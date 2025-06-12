@@ -1,8 +1,8 @@
 import numpy as np
 import jax.numpy as jnp
-def operator(x):
+def operator(x, data_object = None):
     n = len(x)
-    M = Operator([n,n], buffer= np.array(x, dtype = complex))
+    M = Operator([n,n], buffer= np.array(x, dtype = complex), data_object=data_object)
     return M
 def kraus(x, **kwargs):
     M = Kraus(buffer= x, **kwargs)
@@ -72,14 +72,16 @@ class Operator:
         return output
 
     def __mul__(self,y):
+        data_object = self.data_object
         if isinstance(y, Operator):
             if y.data_object == 'jax':
                 data = jnp.matmul(self._data, y._data)
+                data_object = 'jax'
             else:
                 data = self.np.matmul(self._data,y._data)
         else:
             data = self._data * y
-        return self._create_new(buffer = data)
+        return self._create_new(buffer = data, data_object = data_object)
 
     def __rmul__(self, y):
         if isinstance(y, Operator): #will never be true!
@@ -204,6 +206,8 @@ class Kraus(Operator):
                 y = self.np.split(y._data, len(y))
         x = self.np.split(self._data, len(self))
         self._data = self.np.vstack(x + y)
+    def is_Kraus(self):
+        return np.sum(self * self.adjoint(),axis=-3) == np.identity(self.shape[-1])
         
 
 class DensityMatrix(Operator): #allow for list of DensityMatrices

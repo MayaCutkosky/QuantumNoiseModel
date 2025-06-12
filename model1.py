@@ -4,30 +4,40 @@ from jax import value_and_grad
 import json
 from data import process_backend
 import numpy as np
-from utils import operator, System, ideal_gates, kraus, DensityMatrix, softmax
+from utils import System, ideal_gates, kraus, DensityMatrix, softmax
 import pickle
 
+#[0.1,0.2,0.3,0.4]
+
+#[1, 4,5,2]
+
+#.1^2* .2^4 ... -> probability of this happening. Want it to be high! Want it to be 1. Can it be 1? No.
+
 class Model:
-    def __init__(self, backend = None, config = None):
+    def __init__(self, backend = None, backend_properties = None, config = None):
         self.circuit_calculation = 'only_used_qubits'
         if config is not None:
             self.load_config(config)
             self.optim = optax.adam(1e-3)
         else:
+            
+            if backend_properties is None:
+                backend_properties = backend.properties()
             (
                 self.num_qubits,
                 self.num_gates,
                 self.connections,
                 self.error_operators,
                 self.readout_err,
-            ) = process_backend(backend.properties())
+            ) = process_backend(backend_properties)
             self.backend = backend
             self.initialize_params()
             
             self.optim = optax.adam(1e-3)
-            self.opt_state = self.optim.init(self.cross_talk_probabilities)
+            self.opt_state = self.optim.init(self.cross_talk_probabilities)        
         self.represented_terms = ['num_qubits', 'connections', 'cross_talk_probabilities']
         
+        self.regularization_fun = lambda p: jnp.exp(p).sum()
         self.grad_fun = value_and_grad(self._calculate_loss, argnums = 1)
         
         self.coupling_map = dict()
@@ -37,8 +47,8 @@ class Model:
             self.coupling_map[q2].add(q1)
             self.coupling_map[q1].add(q2)
 
-    def initialize_params(self):
-        r = np.random.rand( len(self.connections), len(self.connections)) / self.num_qubits / 100
+    def initialize_params(self, noise = 0.01):
+        r = np.random.rand( len(self.connections), len(self.connections)) / self.num_qubits * noise
         r[np.arange(len(self.connections)), np.arange(len(self.connections))] = 0        
         self.cross_talk_probabilities = np.diag(1 - r.sum(axis = 1)) + r
         self.cross_talk_probabilities = jnp.array(self.cross_talk_probabilities)
@@ -62,15 +72,15 @@ class Model:
         
         #$\\rho^{(1)} = (1 - \\sum_{g' \\in G} p_{g,g'}) C_g R_T \\rho^{(0)} R_T^\\dagger C_g^{\\dagger} + \\sum_{g' \\in G}  p_{g,g'} C_{g'}C_g R_T \\rho^{(0)} R_T^\\dagger (C_gC_{g'})^{\\dagger}  $
         probs = cross_talk_prob_params[self.connections.index(qubit_ids)]
-        rho = DensityMatrix(buffer = sys.rho) * (1 - probs.sum())
+        rho = DensityMatrix(buffer = jnp.zeros(sys.rho.shape))
         sys.careful_mode = False
         for i, (cross_talk_qubits, err_operator) in enumerate(self.error_operators[gate_type].items()):
-            if cross_talk_qubits == qubit_ids:
-                continue
-            if cross_talk_qubits[0] in used_qubits and cross_talk_qubits[1] in used_qubits:
-                p = probs[i]
+            p = probs[i]
+            if cross_talk_qubits == qubit_ids or cross_talk_qubits[0] not in used_qubits or cross_talk_qubits[1] not in used_qubits:
+                rho += DensityMatrix(buffer = sys.rho) * p
+            else:
                 operator =  err_operator['depol'] * ideal_gates['cz']
-                rho +=sys.transition_qubit(operator, cross_talk_qubits, in_place = False) * p
+                rho += sys.transition_qubit(operator, cross_talk_qubits, in_place = False) * p
 
         sys.rho = rho
         return sys
@@ -78,11 +88,12 @@ class Model:
             
 
     def run(self, circuit, readout_qubits, used_qubits = None) -> np.ndarray:
-        return self._run(circuit, readout_qubits, used_qubits, self.cross_talk_probabilities)
+        return self._run(circuit, readout_qubits, used_qubits, self.normalize_params(self.cross_talk_probabilities))
     def _run(self, circuit, readout_qubits, used_qubits, params):
         if self.circuit_calculation == 'exact':
             sys = System(self.num_qubits, data_object='jax')
         elif self.circuit_calculation == 'only_used_qubits':
+            used_qubits = list(used_qubits)
             for q in list(used_qubits):
                 for qn in self.coupling_map[q]:
                     if qn not in used_qubits:
@@ -107,23 +118,34 @@ class Model:
     def normalize_params(params):
         exp_x = jnp.exp(params).T
         return (exp_x / exp_x.sum(0)).T
-        
+    
+    def calculate_log_likelihood(self,sample):
+        circuit, readout_qubits, used_qubits, exp_readout = sample
+        readout_probs = self._run(circuit, readout_qubits, used_qubits, self.normalize_params(self.cross_talk_probabilities))
+        log_readout_probs = np.log(readout_probs+1e-8)
+        binary_conversion_inds = np.arange(len(readout_qubits)), np.array([list(np.binary_repr(i, width=len(readout_qubits))) for i in range(2**len(readout_qubits))], dtype=int)
+        log_pred_readout = np.sum(log_readout_probs[binary_conversion_inds],axis = 1)
+        return np.sum(np.array(exp_readout) * log_pred_readout)
+ 
         
     def _calculate_loss(self, sample, params):
         
         params = self.normalize_params(params)
 
         circuit, readout_qubits, used_qubits, exp_readout = sample
-
+        
+        non_zero_inds = np.nonzero(exp_readout)[0]
+        
         readout_probs = self._run(circuit, readout_qubits, used_qubits,  params)
         log_readout_probs = jnp.log(readout_probs + 1e-8) #deal with prob = 0
         binary_conversion_inds = np.arange(len(readout_qubits)), np.array([list(np.binary_repr(i, width=len(readout_qubits))) for i in range(2**len(readout_qubits))], dtype=int)
         log_pred_readout = jnp.sum(log_readout_probs[binary_conversion_inds],axis = 1)
-        loss = - np.sum(jnp.array(exp_readout) * log_pred_readout) 
         
-        cross_talk_probs = params.at[np.arange(len(params)), np.arange(len(params))].subtract(params[np.arange(len(params)), np.arange(len(params))])
-
-        return loss + jnp.exp(cross_talk_probs).sum()
+        loss =  np.sum( jnp.square(jnp.log(exp_readout[non_zero_inds]) - log_pred_readout[non_zero_inds]) )
+        
+        #cross_talk_probs = params.at[np.arange(len(params)), np.arange(len(params))].subtract(params[np.arange(len(params)), np.arange(len(params))])
+        
+        return loss #+ self.regularization_fun(cross_talk_probs)
 
     def calculate_loss(self, sample):
         '''

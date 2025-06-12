@@ -6,6 +6,23 @@ import warnings
 from utils import pauli, operator, kraus
 
 def relaxation_error(prop, qubit, gate_length):
+    '''
+    
+
+    Parameters
+    ----------
+    prop : qiskit backend_properties object
+        DESCRIPTION.
+    qubit : int
+        DESCRIPTION.
+    gate_length : float
+        DESCRIPTION.
+
+    Returns
+    -------
+    List of numpy arrays
+
+    '''
     t1,t2 = prop.t1(qubit), prop.t2(qubit)
     if t1 * 2 < t2:
         warnings.warn("t2 > 2t1 for qubit {}. Changing {} to {}".format(qubit, t2, 2 * t1))
@@ -13,7 +30,7 @@ def relaxation_error(prop, qubit, gate_length):
 
     p_reset = 1 - np.exp(-gate_length /t1)
     exp_t2 = np.exp(-gate_length / t2)
-    if 1 - p_reset < 1e-12 or exp_t2 < 1e-12:
+    if p_reset < 1e-12 or exp_t2 < 1 - 1e-12:
         return [np.identity(2)]
     err = qiskit_Kraus(Choi(
                 np.array(
@@ -31,12 +48,13 @@ def relaxation_error(prop, qubit, gate_length):
 
 def gate_error(gate_err, relax_err, num_qubits):
     relax_fid = average_gate_fidelity(relax_err)
-    dim = 2 ** num_qubits
-    
-    max_gate_err = dim / (dim + 1)
-    gate_err = min(gate_err, max_gate_err)
+    dim = 4 ** num_qubits
     
     depol_param = dim * (gate_err + relax_fid - 1) / (dim * relax_fid - 1)
+    
+    max_err = 4**num_qubits / (4**num_qubits - 1)
+    depol_param = min(max_err, depol_param)
+    
     return depol_param / (4 ** num_qubits)
 
 def process_gate_data(g):
@@ -53,8 +71,6 @@ def process_gate_data(g):
 
 def get_errs_from_gate(prop, g):
     name, qubits, gate_err, gate_length = process_gate_data(g)
-    if qubits[0] == 32 and name == 'cz':
-        print(gate_err)
     relax_errs = []
     for q in range(len(prop.qubits)):
         relax_errs.append(relaxation_error(prop, q, gate_length))
@@ -64,7 +80,7 @@ def get_errs_from_gate(prop, g):
         relax_gate_err = relax_gate_err.expand(qiskit_Kraus(relax_errs[q]))
     depol_err = gate_error(gate_err, relax_gate_err, len(qubits))
     if depol_err < 0 :
-        return kraus(relax_errs), operator(np.identity(2**len(qubits)))
+        return kraus(relax_errs), kraus([np.identity(2**len(qubits)).tolist()])
     gen = it.product(pauli.keys(),repeat = len(qubits))
     gen.__next__()
     kraus_input = []
