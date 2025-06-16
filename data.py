@@ -128,11 +128,41 @@ def process_backend(prop):
 import json
 import qiskit
 from qiskit import qpy
+
 class Dataset:
     def __init__(self, filename):
         self.data_dir = filename.rpartition('/')[0]
+        self.data_inds = None
+        self.restrictions = None
         with open(filename) as f:
             self.data_dicts = json.load( f)
+        
+    def set_restrictions(self, restrictions):
+        '''
+        Sets up so only acceptable data entries are used for functions like getitem
+
+        Parameters
+        ----------
+        restrictions : list of functions
+            Each function takes sample and data_dict for input and returns a boolean
+
+        Returns
+        -------
+        None.
+
+        '''
+        self.data_inds = None
+        new_data_inds = []
+        for i, (sample, data_dict) in enumerate(zip(self, self.data_dicts)):
+            sample_is_good = True
+            for restrict_fun in restrictions:
+                sample_is_good = sample_is_good and restrict_fun(sample, data_dict)
+                    
+            if sample_is_good:
+                new_data_inds.append(i)
+                    
+        self.restrictions = restrictions
+        self.data_inds = new_data_inds
         
 
     def load_circuit(self, filename):
@@ -169,7 +199,10 @@ class Dataset:
         return exp_readout
     
     def __getitem__(self, i):
-        d = self.data_dicts[i]
+        if self.data_inds is None:
+            d = self.data_dicts[i]
+        else:
+            d = self.data_dicts[self.data_inds[i]]
         #somehow load data
         circuit, readout_qubits, used_qubits =  self.translate_circuit(self.load_circuit(d['filename'])[0])
         exp_readout = self.translate_job_measurements(d['job_measurements'], len(readout_qubits))
@@ -177,8 +210,17 @@ class Dataset:
         return circuit, readout_qubits, used_qubits, exp_readout
         
     def __len__(self):
-        return len(self.data_dicts)
+        if self.data_inds is None:
+            return len(self.data_dicts)
+        else:
+            return len(self.data_inds)
+    
+    
 
+def restrict_machine(machine_name):
+    return lambda sample, data_dict : data_dict['machine'] == machine_name
 
+def restrict_circuit_size(max_circuit_len, min_circuit_len = 0):
+    return lambda sample, data_dict : len(sample[0]) <= max_circuit_len and len(sample[0]) >= min_circuit_len
 
 

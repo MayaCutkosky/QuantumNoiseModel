@@ -7,11 +7,6 @@ import numpy as np
 from utils import System, ideal_gates, kraus, DensityMatrix, softmax
 import pickle
 
-#[0.1,0.2,0.3,0.4]
-
-#[1, 4,5,2]
-
-#.1^2* .2^4 ... -> probability of this happening. Want it to be high! Want it to be 1. Can it be 1? No.
 
 class Model:
     def __init__(self, backend = None, backend_properties = None, config = None):
@@ -77,7 +72,7 @@ class Model:
         for i, (cross_talk_qubits, err_operator) in enumerate(self.error_operators[gate_type].items()):
             p = probs[i]
             if cross_talk_qubits == qubit_ids or cross_talk_qubits[0] not in used_qubits or cross_talk_qubits[1] not in used_qubits:
-                rho += DensityMatrix(buffer = sys.rho) * p
+                rho += DensityMatrix(buffer = sys.rho) * p 
             else:
                 operator =  err_operator['depol'] * ideal_gates['cz']
                 rho += sys.transition_qubit(operator, cross_talk_qubits, in_place = False) * p
@@ -104,7 +99,7 @@ class Model:
 
         for instruction in circuit:
             sys = self._run_instruction(sys, instruction, used_qubits, params)
-        
+        assert (jnp.isfinite(sys.rho._data) ).prod
         if self.circuit_calculation == 'only_used_qubits':
             readout_qubits =  np.array([used_qubits.index(q) for q in readout_qubits])
         readout_probs = [
@@ -143,9 +138,9 @@ class Model:
         
         loss =  np.sum( jnp.square(jnp.log(exp_readout[non_zero_inds]) - log_pred_readout[non_zero_inds]) )
         
-        #cross_talk_probs = params.at[np.arange(len(params)), np.arange(len(params))].subtract(params[np.arange(len(params)), np.arange(len(params))])
+        cross_talk_probs = params.at[np.arange(len(params)), np.arange(len(params))].multiply(0)#.subtract(params[np.arange(len(params)), np.arange(len(params))])
         
-        return loss #+ self.regularization_fun(cross_talk_probs)
+        return loss + self.regularization_fun(cross_talk_probs)
 
     def calculate_loss(self, sample):
         '''
@@ -168,7 +163,7 @@ class Model:
 
     def train_step(self, sample):
         loss, grad = self.grad_fun(sample, self.cross_talk_probabilities )
-        updates, self.opt_state = self.optim.update( grad , self.opt_state )
+        updates, self.opt_state = self.optim.update( grad , self.opt_state, value = loss )
         self.cross_talk_probabilities = optax.apply_updates(self.cross_talk_probabilities, updates)
         return loss 
 
@@ -224,3 +219,12 @@ class Model:
             d[term] = getattr(self, term)
         return 'Model1'+ repr(d)
 
+
+import matplotlib.pyplot as plt
+def plot_cross_talk(model):
+    params = model.normalize_params(model.cross_talk_probabilities)
+    plt.imshow(np.log(params))
+    plt.xlabel('gate being used')
+    plt.ylabel('cross talk gate')
+    plt.show()
+    
