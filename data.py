@@ -80,18 +80,18 @@ def get_errs_from_gate(prop, g):
         relax_gate_err = relax_gate_err.expand(qiskit_Kraus(relax_errs[q]))
     depol_err = gate_error(gate_err, relax_gate_err, len(qubits))
     if depol_err < 0 :
-        return kraus(relax_errs), kraus([np.identity(2**len(qubits)).tolist()])
-    gen = it.product(pauli.keys(),repeat = len(qubits))
-    gen.__next__()
-    kraus_input = []
-    for key_list in gen:
-        pauli_err = operator([1])
-        for key in key_list:
-            pauli_err = pauli_err.tensor(pauli[key])
-        kraus_input.append(np.sqrt(depol_err).tolist() * pauli_err)
-    kraus_input.append(np.sqrt(1-len(kraus_input)*depol_err).tolist() * np.identity(2**len(qubits)))
+        return kraus(relax_errs), 0#kraus([np.identity(2**len(qubits)).tolist()])
+    # gen = it.product(pauli.keys(),repeat = len(qubits))
+    # gen.__next__()
+    # kraus_input = []
+    # for key_list in gen:
+    #     pauli_err = operator([1])
+    #     for key in key_list:
+    #         pauli_err = pauli_err.tensor(pauli[key])
+    #     kraus_input.append(np.sqrt(depol_err).tolist() * pauli_err)
+    # kraus_input.append(np.sqrt(1-len(kraus_input)*depol_err).tolist() * np.identity(2**len(qubits)))
 
-    return kraus(relax_errs), kraus(kraus_input)
+    return kraus(relax_errs), depol_err #kraus(kraus_input)
 
 def get_readout_errs(q):
     probs = [None, None]
@@ -133,11 +133,15 @@ class Dataset:
     def __init__(self, filename):
         self.data_dir = filename.rpartition('/')[0]
         self.data_inds = None
-        self.restrictions = None
+        self.restrictions = []
         with open(filename) as f:
             self.data_dicts = json.load( f)
-        
-    def set_restrictions(self, restrictions):
+    
+    def remove_restrictions(self):
+        self.restrictions = []
+        self.data_inds = None
+    
+    def add_restrictions(self, *args):
         '''
         Sets up so only acceptable data entries are used for functions like getitem
 
@@ -145,13 +149,16 @@ class Dataset:
         ----------
         restrictions : list of functions
             Each function takes sample and data_dict for input and returns a boolean
+            Multiple arguments act like or. add_restriction([f,g], h) returns the indices 
+            for which f(sample, data_dict) and g(sample, data_dict) are both True, or 
+            h(sample, data_dict) is true.
 
         Returns
         -------
         None.
 
         '''
-        self.data_inds = None
+        restrictions = args[0]
         new_data_inds = []
         for i, (sample, data_dict) in enumerate(zip(self, self.data_dicts)):
             sample_is_good = True
@@ -161,8 +168,11 @@ class Dataset:
             if sample_is_good:
                 new_data_inds.append(i)
                     
-        self.restrictions = restrictions
-        self.data_inds = new_data_inds
+        self.restrictions += restrictions
+        if self.data_inds is None:
+            self.data_inds = new_data_inds
+        else:
+            self.data_inds = np.array(self.data_inds)[new_data_inds]
         
 
     def load_circuit(self, filename):
@@ -207,7 +217,7 @@ class Dataset:
         circuit, readout_qubits, used_qubits =  self.translate_circuit(self.load_circuit(d['filename'])[0])
         exp_readout = self.translate_job_measurements(d['job_measurements'], len(readout_qubits))
         
-        return circuit, readout_qubits, used_qubits, exp_readout
+        return (circuit, readout_qubits, used_qubits), exp_readout
         
     def __len__(self):
         if self.data_inds is None:
@@ -221,6 +231,6 @@ def restrict_machine(machine_name):
     return lambda sample, data_dict : data_dict['machine'] == machine_name
 
 def restrict_circuit_size(max_circuit_len, min_circuit_len = 0):
-    return lambda sample, data_dict : len(sample[0]) <= max_circuit_len and len(sample[0]) >= min_circuit_len
+    return lambda sample, data_dict : len(sample[0][0]) <= max_circuit_len and len(sample[0][0]) >= min_circuit_len
 
 

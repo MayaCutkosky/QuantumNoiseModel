@@ -120,8 +120,13 @@ class Operator:
 
     def tensor(self, y):
         if isinstance(y, Operator):
-            y = y._data
-        data = self.np.kron(self._data,y)
+            y_data = y._data
+        else:
+            y_data = y
+        data = self.np.kron(self._data,y_data)
+        if isinstance(y, Kraus):
+            return y._create_new(buffer = data)
+
         return self._create_new(buffer = data)
 
     def adjoint(self):
@@ -220,6 +225,12 @@ class DensityMatrix(Operator): #allow for list of DensityMatrices
             if len(U.shape) > 3:
                 self._data = self.np.reshape(self._data, self.shape)
             output = output.sum(axis = -3)
+        trace = jnp.trace(output._data, 0,-1,-2)
+        if trace.shape == ():
+            trace = jnp.tile(trace, [self.shape[-1], self.shape[-2]])
+        else:
+            trace = jnp.tile(trace, [self.shape[-1], self.shape[-2],1]).T
+        #output._data = output._data / trace
         return output
 
     def partial_trace(self, i):
@@ -233,7 +244,7 @@ class DensityMatrix(Operator): #allow for list of DensityMatrices
         i2 = i1 + m
         j2 = i2.T
 
-        return self[...,i1,j1] + self[...,i2,j2]
+        return self[...,j1,i1] + self[...,j2,i2]
 
     def measure(self, psi):
         output = self.np.matmul(self.np.matmul([psi], self),psi)
@@ -253,32 +264,32 @@ def density_matrix(x, **kwargs):
 class System:
     def __init__(self,size = None, config = None, **kwargs):
         if config is None:
-            self.rho = density_matrix(size * [[[1,0],[0,0]]], **kwargs)
+            self.rho = density_matrix([1] + [0] * (2**size - 1), **kwargs)
             self.careful_mode = True
+            self.num_qubits = size
         else:
             for key, value in config.items():
                 setattr(self, key, value)
     def transition_qubit(self,U, qubits, in_place = True):
-        if in_place:
-            rho = self.rho
-        else:
-            rho = DensityMatrix(buffer = self.rho)
-        if self.careful_mode:
+        if self.careful_mode and not isinstance(U, tuple):
             assert U.is_unitary
             assert U.shape[-1] == U.shape[-2]
-            assert U.shape[-1] == 2 ** len(qubits)
 
-        if len(qubits) == 1:
-            i = qubits[0]
-            rho[i] = rho[i].transition(U)
+        qubits = list(qubits)
+        qubits.sort()
 
-        elif len(qubits) == 2:
-            i,j = qubits
-            combined_rho = rho[i].tensor(rho[j])
-            combined_rho = combined_rho.transition(U)
-            rho[i] = combined_rho.partial_trace(1)
-            rho[j] = combined_rho.partial_trace(0)
-            
+        if len(qubits) == 2:
+            U0, U1 = U
+            mid_qubits = np.identity(int(2 ** int(qubits[1] - qubits[0] - 1)))
+            op = operator([[1,0],[0,0]]).tensor(mid_qubits).tensor(U0) 
+            op += operator([[0,0],[0,1]]).tensor(mid_qubits).tensor(U1)
+        else:
+            op = U
+
+        op = operator(np.identity(2 ** qubits[0])).tensor(op).tensor(operator(np.identity(2 ** (self.num_qubits - qubits[-1]-1))))
+        rho = self.rho.transition(op)
+        if in_place:
+            self.rho = rho
         return rho
 
 
@@ -286,11 +297,18 @@ class System:
         '''
             U : list of operators of length self.rho
         '''
-        if not in_place:
-            sys = System(self.config())
-            sys.transition(U)
-            return sys
-        self.rho = self.rho.transition(U)
+        if len(U) == len(self.rho) or len(U.shape) == 4:
+            op = operator([1])
+            for Ui in U:
+                op = op.tensor(Ui)            
+        else:
+            op = operator([1])
+            for _ in range(self.num_qubits):
+                op = op.tensor(U)
+        rho = self.rho.transition(op)
+        if in_place:
+            self.rho = rho
+        return rho
 
 import itertools as it
 pauli = {
@@ -312,10 +330,11 @@ ideal_gates = {
     'x' : pauli['X'],
     'sx' : operator([[complex(1,1),complex(1,-1)],[complex(1,-1),complex(1,1)]])/2,
     'rz' : lambda phi : operator([[expi(-phi/2),0],[0,expi(phi/2)]]),
+    'cz' : (pauli['I'], pauli['Z']),
 }
-cz = np.identity(4)
-cz[3,3] = -1
-ideal_gates['cz'] = operator(cz)
+#cz = np.identity(4)
+#cz[3,3] = -1
+#ideal_gates['cz'] = operator(cz)
 
 def sigmoid(x):
     return 1 / ( 1 + np.exp(-x))
@@ -359,5 +378,15 @@ def add_gate(circuit, used_qubits, coupling_map, distance = 1):
                 new_gate = ('cz', (q1,q2), None)
             break
     circuit.insert(np.random.randint(len(circuit)), new_gate)
-    used_qubits + [q1,q2]
+    used_qubits += [q1,q2]
+    return circuit, used_qubits
+
+def add_X_gates(circuit, used_qubits, coupling_map, distance = 1):
+    possible_qubits, near_qubits = find_neighboring_qubits(used_qubits, coupling_map, distance, True)
+    q = int(np.random.choice(list(possible_qubits)))
+    ind = np.random.randint(len(circuit))
+    new_gate = ('x',(q,), None)
+    circuit.insert(ind, new_gate)
+    circuit.insert(ind, new_gate)
+    used_qubits.append(q)
     return circuit, used_qubits
