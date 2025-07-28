@@ -1,5 +1,7 @@
 import numpy as np
 import jax.numpy as jnp
+from jax.tree_util import register_pytree_node_class
+
 def operator(x, data_object = None):
     n = len(x)
     M = Operator([n,n], buffer= np.array(x, dtype = complex), data_object=data_object)
@@ -8,7 +10,12 @@ def kraus(x, **kwargs):
     M = Kraus(buffer= x, **kwargs)
     return M
 
+def digit_ind_to_binary_inds(n):
+    return np.tile( np.arange(2**n), [1,1]).T // 2 ** (n - 1 - np.tile(np.arange(n-1,-1,-1), [1,1]) ) % 2
 
+def binary_inds_to_digit_ind(inds):
+    n = len(inds[0])
+    return np.sum(2 ** np.arange(n-1, -1, -1) * inds,axis=1)
 
 class Operator:
     def __init__(self, shape = [2,2], dtype = complex, buffer = None, data_object = None):
@@ -81,7 +88,7 @@ class Operator:
                 data = self.np.matmul(self._data,y._data)
         else:
             data = self._data * y
-        return self._create_new(buffer = data, data_object = data_object)
+        return self._create_new(buffer = data)
 
     def __rmul__(self, y):
         if isinstance(y, Operator): #will never be true!
@@ -128,6 +135,17 @@ class Operator:
             return y._create_new(buffer = data)
 
         return self._create_new(buffer = data)
+    def rtensor(self, y):
+        if isinstance(y, Operator):
+            y_data = y._data
+        else:
+            y_data = y
+        data = self.np.kron(y_data, self._data)
+        if isinstance(y, Kraus):
+            return y._create_new(buffer = data)
+
+        return self._create_new(buffer = data)
+        
 
     def adjoint(self):
         data = self.np.swapaxes(self.np.conj(self._data),-1,-2)
@@ -213,9 +231,15 @@ class Kraus(Operator):
         self._data = self.np.vstack(x + y)
     def is_Kraus(self):
         return np.sum(self * self.adjoint(),axis=-3) == np.identity(self.shape[-1])
-        
 
-class DensityMatrix(Operator): #allow for list of DensityMatrices
+
+class DensityMatrix(Operator):
+    def __init__(self, *args, **kwargs):
+        super().__init__( *args, **kwargs)
+        self.type = 'density_matrix'
+        self.num_qubits = np.log2(self.shape[-1])
+        assert self.num_qubits % 1 == 0
+        self.num_qubits = int(self.num_qubits)
     def transition(self,U : Operator):
         is_Kraus = isinstance(U,Kraus)
         if is_Kraus and len(U.shape) > 3:
@@ -225,15 +249,37 @@ class DensityMatrix(Operator): #allow for list of DensityMatrices
             if len(U.shape) > 3:
                 self._data = self.np.reshape(self._data, self.shape)
             output = output.sum(axis = -3)
-        trace = jnp.trace(output._data, 0,-1,-2)
-        if trace.shape == ():
-            trace = jnp.tile(trace, [self.shape[-1], self.shape[-2]])
-        else:
-            trace = jnp.tile(trace, [self.shape[-1], self.shape[-2],1]).T
-        #output._data = output._data / trace
+        # trace = jnp.trace(output._data, 0,-1,-2)
+        # if trace.shape == ():
+        #     trace = jnp.tile(trace, [self.shape[-1], self.shape[-2]])
+        # else:
+        #     trace = jnp.tile(trace, [self.shape[-1], self.shape[-2],1]).T
+        # output._data = output._data / trace
         return output
+    
+    def transition_qubit(self,U, qubits):
+        qubits = list(qubits)
+        qubits.sort()
+        if len(qubits) == 2:
+            U0, U1 = U
+            mid_qubits = np.identity(int(2 ** int(qubits[1] - qubits[0] - 1)))
+            op = operator([[1,0],[0,0]]).tensor(mid_qubits).tensor(U0) 
+            op += operator([[0,0],[0,1]]).tensor(mid_qubits).tensor(U1)
+        else:
+            op = U
+        op = operator(np.identity(2 ** qubits[0])).tensor(op).tensor(operator(np.identity(2 ** (self.num_qubits - qubits[-1]-1))))
+        return self.transition(op)
+
 
     def partial_trace(self, i):
+        if isinstance(i, list):
+            l = i
+            l .sort()
+            l.reverse()
+            rho = self._create_new(buffer = self._data)
+            for i in l:
+                rho = rho.partial_trace(i)
+            return rho
         #shape : s, i,j
         n = int(2 ** i)
         m = len(self) // (2*n)
@@ -251,64 +297,163 @@ class DensityMatrix(Operator): #allow for list of DensityMatrices
         assert output.imag == 0
         return output.real[0]
 
+#hacky...
+@register_pytree_node_class
+class JaxDensityMatrix(DensityMatrix):
+    def __init__(self,buffer):
+        self.type = 'density_matrix'
+        self._data = buffer
+        self.data_object = 'jax'
+        self.np = jnp
+        self.set_attr()
+    
+    def set_attr(self):
+        
+        for attr in ['real', 'imag']:
+            setattr(self, attr, getattr(self._data, attr,0.))
+        setattr(self, 'shape', getattr(self._data, 'shape',(1,1)))
+        self.num_qubits = np.log2(self.shape[-1])
+        self.num_qubits = int(self.num_qubits)
+    
+    def __repr__(self):
+        return "DensityMatrix({})".format(self._data)
+
+    def tree_flatten(self):
+        
+        children = (self._data,)
+        aux_data = None
+        return (children, aux_data)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        obj = cls(*children)
+        obj.set_attr()
+        return obj
 
 def density_matrix(x, **kwargs):
     if len(np.shape(x)) == 1: # x is a state
         #make x a proper state
         x = x / np.linalg.norm(x)
         x = np.matmul(np.expand_dims(x,1),[x])
-    rho = DensityMatrix(np.shape(x), complex, np.array(x, dtype = complex), **kwargs)
+    if kwargs.get('data_object') == 'jax':
+        rho = JaxDensityMatrix(jnp.array(np.array(x, dtype = complex)))
+    else:
+        rho = DensityMatrix(np.shape(x), complex, np.array(x, dtype = complex), **kwargs)
     assert rho.shape[-1] == rho.shape[-2]
     return rho
 
+from jax import lax
 class System:
     def __init__(self,size = None, config = None, **kwargs):
         if config is None:
-            self.rho = density_matrix([1] + [0] * (2**size - 1), **kwargs)
+            self.rho = []
+            self.reverse_ind = []
+            for i in range(size):
+                self.rho.append(density_matrix([[1,0],[0,0]], **kwargs))
+                self.reverse_ind.append([i])
+            self.inds = np.zeros([size,2], dtype = int)
+            self.inds[:,0] = np.arange(size).astype(int)
             self.careful_mode = True
             self.num_qubits = size
         else:
             for key, value in config.items():
                 setattr(self, key, value)
-    def transition_qubit(self,U, qubits, in_place = True):
-        if self.careful_mode and not isinstance(U, tuple):
-            assert U.is_unitary
-            assert U.shape[-1] == U.shape[-2]
+    def transition_qubit(self,U, qubits, in_place = True, return_gradient = False):
+        '''
+        
 
-        qubits = list(qubits)
-        qubits.sort()
+        Parameters
+        ----------
+        U : TYPE
+            DESCRIPTION.
+        qubits : TYPE
+            DESCRIPTION.
+        in_place : TYPE, optional
+            Currently in_place = False is not implimented. The default is True.
+        return_gradient : TYPE, optional
+            Gradient is dictionary of values with rho as the uncompressed n by n matrix, where n is the number of qubits. The default is False.
 
+        Raises
+        ------
+        NotImplementedError
+            DESCRIPTION.
+
+        Returns
+        -------
+        None.
+
+        '''
+        if not in_place:
+            raise NotImplementedError()
         if len(qubits) == 2:
-            U0, U1 = U
-            mid_qubits = np.identity(int(2 ** int(qubits[1] - qubits[0] - 1)))
-            op = operator([[1,0],[0,0]]).tensor(mid_qubits).tensor(U0) 
-            op += operator([[0,0],[0,1]]).tensor(mid_qubits).tensor(U1)
+            ind0, i = self.inds[qubits[0]]
+            ind1, j = self.inds[qubits[1]]
+            
+            if ind0 == ind1:
+                self.rho[ind0] = self.rho[ind0].transition_qubit(U, [i,j])
+                
+            else:
+                if ind0 > ind1:
+                    rho0, rho1 = self.rho.pop(ind0), self.rho.pop(ind1)
+                    reverse_ind0, reverse_ind1 = self.reverse_ind.pop(ind0), self.reverse_ind.pop(ind1)
+                else:
+                    rho1, rho0 = self.rho.pop(ind1), self.rho.pop(ind0)
+                    reverse_ind1, reverse_ind0 = self.reverse_ind.pop(ind1), self.reverse_ind.pop(ind0)
+                rho = rho0.tensor(rho1)
+                
+                j = j + len(reverse_ind0)
+                rho = rho.transition_qubit(U, [i,j])
+                self.rho.append(rho)
+                
+                reverse_ind = reverse_ind0 + reverse_ind1
+                self.reverse_ind.append(reverse_ind)
+                
+                for ind, rev_inds in enumerate(self.reverse_ind):
+                    for rev_ind in rev_inds:
+                        self.inds[rev_ind,0] =  ind
+                self.inds[reverse_ind1, 1] = self.inds[reverse_ind1, 1] + len(reverse_ind0)
+            
+        elif len(qubits) == 1:
+            ind, i = self.inds[qubits[0]]
+            self.rho[ind] = self.rho[ind].transition_qubit(U, (i,) )
         else:
-            op = U
+            raise NotImplementedError()
 
-        op = operator(np.identity(2 ** qubits[0])).tensor(op).tensor(operator(np.identity(2 ** (self.num_qubits - qubits[-1]-1))))
-        rho = self.rho.transition(op)
-        if in_place:
-            self.rho = rho
-        return rho
-
-
-    def transition(self, U, in_place = True):
+    def transition(self, U_array):
         '''
             U : list of operators of length self.rho
         '''
-        if len(U) == len(self.rho) or len(U.shape) == 4:
-            op = operator([1])
-            for Ui in U:
-                op = op.tensor(Ui)            
-        else:
-            op = operator([1])
-            for _ in range(self.num_qubits):
-                op = op.tensor(U)
-        rho = self.rho.transition(op)
-        if in_place:
-            self.rho = rho
-        return rho
+        for i, (rho, qubit_inds) in enumerate(zip(self.rho, self.reverse_ind)):
+            U = U_array._create_new(buffer = [1])
+            for Ui in U_array[qubit_inds]:
+                U = U.tensor(Ui)
+            self.rho[i] = rho.transition(U)
+            
+        return self.rho
+    def calc_probabilities(self, readout_qubits = None):
+        if readout_qubits is None:
+            readout_qubits = np.arange(self.num_qubits).tolist()
+        prob = 1
+        binary_inds = digit_ind_to_binary_inds(len(readout_qubits))
+        for rho, qubit_inds in zip(self.rho, self.reverse_ind):
+            inds = []
+            extra_qubit_inds = []
+            for i, q in enumerate(qubit_inds):
+                if q in readout_qubits:
+                    inds.append(readout_qubits.index(q))
+                else: 
+                    extra_qubit_inds.append(i)
+            if len(extra_qubit_inds):
+                rho = rho.partial_trace(extra_qubit_inds)
+            local_prob_inds = binary_inds_to_digit_ind( binary_inds[:,inds] )
+            local_prob = rho(local_prob_inds, local_prob_inds).real+1e-8
+            
+            prob *= local_prob
+        return prob
+        
+            
+            
+            
 
 import itertools as it
 pauli = {

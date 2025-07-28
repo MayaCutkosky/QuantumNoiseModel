@@ -1,36 +1,184 @@
 import jax.numpy as jnp
 import optax
-from jax import value_and_grad, clear_caches, random, custom_gradient
+from jax import value_and_grad, clear_caches, random, custom_gradient, jit
 import json
 from data import process_backend
 import numpy as np
-from utils import System, ideal_gates, kraus, DensityMatrix, softmax, pauli, operator
+from utils import System, ideal_gates, kraus, softmax, pauli, operator, density_matrix, JaxDensityMatrix
 import pickle
 import itertools as it
 
-#from cursor
-@custom_gradient
-def ste_choice(p, key, n):
-    # Forward: discrete sampling
-    idx = random.choice(key, jnp.arange(n), p=p)
-    
-    # Backward: gradient flows through p
-    def grad_fn(dy):
-        return dy * jnp.ones_like(p), None, None
-    
-    return idx, grad_fn
-
+import jax
 class RandomGenerator:
     def __init__(self):
-        self.key = random.PRNGKey(0)
-        self.i = 0
+        self.key = random.PRNGKey(10)
+        self.i = 20
     def get_subkey(self):
         self.i += 1
         return random.fold_in(self.key, self.i)
-        
-    def random_choice(self, p, n):
+    def random_int(self, p, n):
+        self.get_subkey()
+        return np.random.default_rng(self.i).choice(np.arange(n), p = p)
         subkey = self.get_subkey()
-        return ste_choice(p, subkey,n)
+        return random.choice(subkey, jnp.arange(n),p=p).tolist()
+
+    def random_choice(self, choices):
+        subkey = self.get_subkey()
+        i = random.randint(subkey, (), len(choices)-1, 0)
+        return choices[i]
+    
+    def boolean(self, p):
+        r = random.uniform(self.get_subkey())
+        r = np.random.default_rng(self.i).uniform()
+        return r > p
+        
+
+
+def tensor_prod_deriv(dC, A, B):
+    '''
+    Finds derivatives for C = A tensor B
+
+    Parameters
+    ----------
+    dC : jnp.array of shape  (m*n, m*n)
+    A : jnp.array of shape (m,m)
+    B : jnp.array of shape (n,n)
+
+    Returns
+    -------
+    dA : jnp.array of shape [m,m]
+    dB : jnp.array of shape (n,n)
+
+    '''
+    m = A.shape[0]
+    n = B.shape[0]
+    
+    i,j,u,v = jnp.indices([m,m,n,n])
+                 
+    dA = jnp.sum( B._data * dC(u+n*i, v+n*j),(2,3) ).T
+    
+    dB = jnp.sum( A._data * dC(i.T * m + u.T, j.T *m + v.T), (2,3) ).T
+    return A._create_new(buffer = dA), B._create_new(buffer = dB)
+
+def partial_trace_derviative(dA, dB):
+    '''
+    Finds derivate for A, B = Tr_B(C), Tr_A(C)
+    '''
+    m = dA.shape[0]
+    n = dB.shape[0]
+    
+    return dA.tensor(jnp.identity(n)) +dB.rtensor(jnp.identity(m))
+#ToDo: Use jax.tree_map to vectorize
+#\rho_i = sum x_j g_j( h_i (\rho_{i-1} ) )
+def calc_del_g_del_h(i,j,n):
+    size = [2 **i, 2 ** (j-i-1), 2 ** (n - j-1)]
+    i,j,k = np.indices(size)
+    diag_neg_vals = (size[1] * size[2]* 2  + size[2] + k + j * size[2]* 2 + i * size[1] * size[2] * 4).ravel()
+    diag_elements = np.ones(2**n)
+    diag_elements[diag_neg_vals] = -1
+    return jnp.array( np.outer(diag_elements, diag_elements) )
+
+
+
+def calc_d_fi(df_i, rho, connections, reverse_ind, k0, x):
+    
+    #will have to fix this, but first
+    dx = [ ]
+    dh = [rho * x[k0]  for rho in df_i]
+    for k, ( (ind0, i), (ind1,j) ) in enumerate(connections):
+        if k == k0:
+            dx.append( sum([(df_i_l._data * rho_l._data).sum() for df_i_l, rho_l in zip(df_i, rho)] ) )
+            continue
+        dx_k = sum([(df_i_l._data * rho_l._data).sum() for l, (df_i_l, rho_l) in enumerate(zip(df_i, rho)) if l != ind0 and l != ind1] )
+        if i > j:
+            i,j = j,i
+            ind0,ind1 = ind1,ind0
+        if ind0 == ind1:
+            dx_k += (rho[ind0].transition_qubit(ideal_gates['cz'],(i,j))._data * df_i[ind0]._data).sum()
+            del_g_del_h = calc_del_g_del_h(i,j,dh[ind0].num_qubits )          
+            dh_ind0 = dh[ind0] * x[k] * del_g_del_h
+            
+            dh = [rho0 * x[k] + rho1 for l, (rho0, rho1) in enumerate(zip(df_i, dh)) ]
+            dh[ind0] = dh_ind0
+
+        else:
+            j = j + reverse_ind[ind0]
+            dx_k += (rho[ind0].tensor(rho[ind1]).transition_qubit(ideal_gates['cz'],(i,j))._data * df_i[ind0].tensor(df_i[ind1])._data).sum()
+                            
+            d_rho0_tensor_rho1 = partial_trace_derviative(df_i[ind0], df_i[ind1]) 
+            
+            del_g_del_h = calc_del_g_del_h(i,j, d_rho0_tensor_rho1.num_qubits)     
+            d_rho0_tensor_rho1 = d_rho0_tensor_rho1 * x[k] * del_g_del_h
+            dh_ind0, dh_ind1 = tensor_prod_deriv(d_rho0_tensor_rho1, rho[ind0], rho[ind1])
+            
+            dh = [rho0 * x[k] + rho1 for l, (rho0, rho1) in enumerate(zip(df_i, dh)) ]
+            dh[ind0] = dh_ind0 + dh[ind0]
+            dh[ind1] = dh_ind1 + dh[ind1]
+        dx.append(dx_k)
+    return jnp.stack(dx).real, dh
+
+
+
+#f_i should be differentiated under the assumption that all possible crosstalk happened, not just the chosen one. But only apply the chosen one.
+def f_i(sys,  x, k,k0, connections, x_prime):
+    
+    @custom_gradient
+    def f_i_diff_fun(x, rho, x_prime):
+        def grad_fn(df_i):
+            dx,dh = calc_d_fi(df_i, rho, connections, reverse_ind, k0, x_prime)
+            return None, dh, dx
+
+        x_k = x[k] #can fix if objects.
+        rho_new = [r for r in rho]
+        rho_new[ind] =  (1-x_k) * rho[ind] + x_k * rho[ind].transition_qubit(ideal_gates['cz'], [i,j]) 
+        return rho_new, grad_fn
+
+    @custom_gradient
+    def f_i_diff_fun2(rho, x_prime):
+        def grad_fn(df_i):
+            dx,dh = calc_d_fi(df_i, rho, connections, reverse_ind, k0, x_prime)
+            return dh, dx
+        return rho, grad_fn
+
+    
+    
+    if k != k0:
+        qubits = connections[k]
+        ind0, i = sys.inds[qubits[0]]
+        ind1, j = sys.inds[qubits[1]]
+        if ind0 == ind1:
+            ind = ind0
+            rho = sys.rho[ind] 
+        
+        else:
+            if ind0 > ind1:
+                rho0, rho1 = sys.rho.pop(ind0), sys.rho.pop(ind1)
+                reverse_ind0, reverse_ind1 = sys.reverse_ind.pop(ind0), sys.reverse_ind.pop(ind1)
+            else:
+                rho1, rho0 = sys.rho.pop(ind1), sys.rho.pop(ind0)
+                reverse_ind1, reverse_ind0 = sys.reverse_ind.pop(ind1), sys.reverse_ind.pop(ind0) 
+            j = j + len(reverse_ind0)
+            
+            rho = rho0.tensor(rho1)
+            ind = len(rho)
+            sys.rho.append(rho)
+                
+            reverse_ind = reverse_ind0 + reverse_ind1
+            sys.reverse_ind.append(reverse_ind)
+                
+            for ind, rev_inds in enumerate(sys.reverse_ind):
+                for rev_ind in rev_inds:
+                    sys.inds[rev_ind,0] =  ind
+            sys.inds[reverse_ind1, 1] = sys.inds[reverse_ind1, 1] + len(reverse_ind0)
+        connections = sys.inds[connections].tolist()
+        reverse_ind = [len(i) for i in sys.reverse_ind]
+        sys.rho = f_i_diff_fun(x, sys.rho, x_prime)
+    else:
+        connections = sys.inds[connections].tolist()
+        reverse_ind = [len(i) for i in sys.reverse_ind]
+        sys.rho =  f_i_diff_fun2(sys.rho, x_prime)
+    
+
 
 def compute_prob_matrix(M): #from cursor
     n = M.shape[0]
@@ -80,14 +228,18 @@ class Model:
             self.optim = optax.polyak_sgd(0.001, 
                                           f_min = 0, 
                                           eps = 1e-8, 
-                                          scaling= optax.schedules.linear_schedule(1, 1e-5, 1e4)
+                                          scaling= 100. #optax.schedules.linear_schedule(1, 1e-5, 1e4)
             )
 
             self.opt_state = self.optim.init(self.cross_talk_probabilities)        
         self.represented_terms = ['num_qubits', 'connections', 'cross_talk_probabilities']
         
         self.regularization_fun = lambda p: 0#jnp.var(p,axis=0).sum() 
-        self.grad_fun = value_and_grad(self._calculate_loss, argnums = 1)
+        
+        self.grad_fun = value_and_grad(self._calculate_loss, argnums=2)
+        #self.grad_fn = jit(self.grad_fn, static_argnums=0)
+        
+        # self.grad_fun = value_and_grad(jit(self._calculate_loss,static_argnums = 0), argnums = 2)
         
         self.coupling_map = dict()
         for q1, q2 in self.connections:
@@ -96,18 +248,19 @@ class Model:
             self.coupling_map[q2].add(q1)
             self.coupling_map[q1].add(q2)
 
-    def initialize_params(self, noise = 0.01):
-        r = np.random.rand( len(self.connections), len(self.connections)) / self.num_qubits * noise
-        r[np.arange(len(self.connections)), np.arange(len(self.connections))] = 0        
-        self.cross_talk_probabilities = np.diag(1 - r.sum(axis = 1)) + r
-        self.cross_talk_probabilities = jnp.array(self.cross_talk_probabilities)
+    def initialize_params(self, noise1 = 0.01, noise2 = 10):
+        r = np.random.rand( len(self.connections), len(self.connections)) / self.num_qubits * noise1
+        r[np.arange(len(self.connections)), np.arange(len(self.connections))] = noise2        
+        self.cross_talk_probabilities = jnp.array(r)
     
     def transition_depol_err(self,sys, gate_type, qubit_ids, sys_qubit_ids):
         depol_err = self.error_operators[gate_type][qubit_ids]['depol']
-        if random.uniform(self.random_gen.get_subkey()) > depol_err:
+        
+        if self.random_gen.boolean(depol_err):
             return #no error
-        depol_operator = self.random_gen.choice(self.random_gen.get_subkey(), list(it.combinations(pauli, len(sys_qubit_ids)))[1:])
-        sys.transition_qubit(depol_operator, sys_qubit_ids)
+        depol_gates = self.random_gen.random_choice(list(it.combinations(pauli, len(sys_qubit_ids)))[1:])
+        for gate, q in zip(depol_gates, sys_qubit_ids):
+            sys.transition_qubit(pauli[gate], (q,))
 
         
     def _run_instruction(self, sys, instruction, used_qubits, cross_talk_prob_params):
@@ -123,25 +276,49 @@ class Model:
         else:
             ideal_operator = ideal_gates[gate_type]
         
-        sys.transition(self.error_operators[gate_type][qubit_ids]['relax'][used_qubits])
+        self.error_operators[gate_type][qubit_ids]['relax'][used_qubits], None
         sys.transition_qubit(ideal_operator, sys_qubit_ids)
+        
         self.transition_depol_err(sys, gate_type, qubit_ids, sys_qubit_ids)
-
         if len(qubit_ids) < 2:
             return sys
-        
         #$\\rho^{(1)} = (1 - \\sum_{g' \\in G} p_{g,g'}) C_g R_T \\rho^{(0)} R_T^\\dagger C_g^{\\dagger} + \\sum_{g' \\in G}  p_{g,g'} C_{g'}C_g R_T \\rho^{(0)} R_T^\\dagger (C_gC_{g'})^{\\dagger}  $
         
         #probabilitic method
         ind = np.isin(self.connections,used_qubits).prod(1)
-        connections =  [qubits for (i, qubits) in zip(ind, self.connections) if i]
-        probs = cross_talk_prob_params[connections.index(qubit_ids)]
-        i = self.random_gen.random_choice(probs, len(connections) )
-        cross_talk_qubits = connections[i]
-        if cross_talk_qubits != qubit_ids:
-            sys_cross_talk_qubit_ids =  [used_qubits.index(q)  for q in cross_talk_qubits]
-            sys.transition_qubit(ideal_gates['cz'],sys_cross_talk_qubit_ids)            
-            self.transition_depol_err(sys, gate_type, qubit_ids, sys_cross_talk_qubit_ids)
+        connections =  [[used_qubits.index(q) for q in qubits] for (i, qubits) in zip(ind, self.connections) if i]
+        j = connections.index(sys_qubit_ids)
+        probs = cross_talk_prob_params[j]
+        
+#        i = self.random_gen.random_int([1 - self.prob_perform_cross_talk* (len(connections)-1) ] +[self.prob_perform_cross_talk] * (len(connections)-1), len(connections) )
+        #x_prime = self.prob_perform_cross_talk * probs
+        
+        rho = 0
+        sys.careful_mode = False
+        for cross_talk_qubits, p in zip( connections, probs):
+            if cross_talk_qubits == sys_qubit_ids:
+                rho_i = rho
+            else:
+                reverse_ind = reverse_ind0 + reverse_ind1
+                self.reverse_ind.append(reverse_ind)
+                
+                for ind, rev_inds in enumerate(self.reverse_ind):
+                    for rev_ind in rev_inds:
+                        self.inds[rev_ind,0] =  ind
+                self.inds[reverse_ind1, 1] = self.inds[reverse_ind1, 1] + len(reverse_ind0)
+            
+
+                depol_err = self.error_operators[gate_type][cross_talk_qubits]['depol']
+                rho_i = sys.rho[0].transition_qubit(ideal_gates['cz'], cross_talk_qubits)
+                rho_i = self.transition_depol_err(rho_i, depol_err, [used_qubits.index(q)  for q in cross_talk_qubits], len(used_qubits))
+                rho_i -= sys.rho[0]
+    
+            
+            rho = rho_i * p + rho
+        sys.rho[0] = sys.rho[0] + rho
+        # if i!= j:
+        #     self.transition_depol_err(sys, gate_type, qubit_ids, connections[i])
+            
         return sys
             
             
@@ -149,28 +326,21 @@ class Model:
     def run(self, circuit, readout_qubits, used_qubits = None) -> np.ndarray:
         return self._run(circuit, readout_qubits, used_qubits, self.prepare_params(self.cross_talk_probabilities, used_qubits))
     def _run(self, circuit, readout_qubits, used_qubits, params):
-        
-        binary_conversion_inds = np.array([list(np.binary_repr(i, width=len(readout_qubits))) for i in range(2**len(readout_qubits))], dtype=int)
         output= 0
-        
-        readout_err_mat = compute_prob_matrix(self.readout_err[readout_qubits])
+        readout_err_mat = compute_prob_matrix(self.readout_err[list(readout_qubits)])
+
         readout_qubits =  [used_qubits.index(q) for q in readout_qubits]
-        
+        used_qubits = list(used_qubits)
         self.random_gen = RandomGenerator()
-        
-        for t in range(10):
+        for i in range(1):
             sys = System(len(used_qubits), data_object = 'jax')
+            for i in range(len(used_qubits)-1):
+                sys.transition_qubit([pauli['I'], pauli['I']], (i, i+1))
             for j, instruction in enumerate(circuit):
                 sys = self._run_instruction(sys, instruction, used_qubits, params)
-                if j % 100 == 0:
-                    readout_probs = sys.calc_probabilities(readout_qubits)
-                    print(np.max(readout_probs))                    
-            # assert (jnp.isfinite(sys.rho._data) ).prod()
             readout_probs = sys.calc_probabilities(readout_qubits)
-            print(np.max(readout_probs))
-            
-            readout_probs = jnp.matmul(readout_probs, readout_err_mat)
-            output += readout_probs/10
+#            readout_probs = jnp.matmul(readout_probs, readout_err_mat)
+            output += readout_probs
         return output
         
 
@@ -181,8 +351,14 @@ class Model:
     
     def prepare_params(self, params, used_qubits):
         ind = np.where(np.isin(self.connections,used_qubits).prod(1))[0]
-        return self.normalize_params(params)[ind][:,ind]
+        probs = self.normalize_params(params)[ind][:,ind]
+        params = probs
+   #     self.prob_perform_cross_talk = 1 / 2 / len(ind)
         
+#        x0 = jnp.diag(probs)
+  #      params = probs / self.prob_perform_cross_talk
+#        params[np.arange(len(ind)), np.arange(len(ind))] = 1 - self.prob_perform_cross_talk - x0
+        return params
     
     
     def calculate_log_likelihood(self,sample):
@@ -191,20 +367,17 @@ class Model:
         return np.sum(np.array(exp_readout) * log_pred_readout)
  
         
-    def _calculate_loss(self, sample, params):
-
-        (circuit, readout_qubits, used_qubits), exp_readout = sample
+    def _calculate_loss(self, sample_inp, exp_readout, params):
+        circuit, readout_qubits, used_qubits = sample_inp
         
         params = self.prepare_params(params, used_qubits)
         
-        
-        non_zero_inds = np.nonzero(exp_readout)[0]
         readout_probs = self._run(circuit, readout_qubits, used_qubits,  params)
-        
-        log_pred_readout = jnp.log(readout_probs[non_zero_inds] + 1e-9) #deal with prob = 0    
-        log_exp_readout = jnp.log((exp_readout/exp_readout.sum())[non_zero_inds])
+        # return readout_probs.sum()
+        log_pred_readout = jnp.log(readout_probs + 1e-9) #deal with prob = 0    
+        log_exp_readout = jnp.log((exp_readout/exp_readout.sum())+1e-9)
         loss =  jnp.sum( jnp.square(log_exp_readout - log_pred_readout) )
-        cross_talk_probs = params.at[np.arange(len(params)), np.arange(len(params))].multiply(0)#.subtract(params[np.arange(len(params)), np.arange(len(params))])
+        # cross_talk_probs = params.at[np.arange(len(params)), np.arange(len(params))].multiply(0)#.subtract(params[np.arange(len(params)), np.arange(len(params))])
         
         return loss #+ self.regularization_fun(cross_talk_probs)
 
@@ -225,12 +398,14 @@ class Model:
         loss : jnp.array
 
         '''
-        return self._calculate_loss(sample, self.normalize_params(self.cross_talk_probabilities) )
+        return self._calculate_loss(sample[0], sample[1], self.cross_talk_probabilities )
 
     def train_step(self, sample):
         clear_caches()
-        loss, grad = self.grad_fun(sample, self.cross_talk_probabilities )
-        assert np.isfinite(grad).prod()
+        x = sample[0]
+        circ = tuple([(inst[0], inst[1], tuple(inst[2])) for inst in x[0]])
+        x = (circ, tuple(x[1].tolist()), tuple(x[2]))
+        loss, grad = self.grad_fun(x, sample[1], self.cross_talk_probabilities )
         updates, self.opt_state = self.optim.update( grad , self.opt_state, value = loss )
         self.cross_talk_probabilities = optax.apply_updates(self.cross_talk_probabilities, updates)
         return loss 
@@ -304,3 +479,4 @@ def plot_cross_talk(model):
     plt.ylabel('cross talk gate')
     plt.show()
     
+
