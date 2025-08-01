@@ -225,10 +225,10 @@ class Model:
             self.backend = backend
             self.initialize_params()
             
-            self.optim = optax.polyak_sgd(0.001, 
+            self.optim = optax.polyak_sgd(0.1, 
                                           f_min = 0, 
                                           eps = 1e-8, 
-                                          scaling= 100. #optax.schedules.linear_schedule(1, 1e-5, 1e4)
+                                          scaling= 1000. #optax.schedules.linear_schedule(1, 1e-5, 1e4)
             )
 
             self.opt_state = self.optim.init(self.cross_talk_probabilities)        
@@ -286,39 +286,34 @@ class Model:
         
         #probabilitic method
         ind = np.isin(self.connections,used_qubits).prod(1)
-        connections =  [[used_qubits.index(q) for q in qubits] for (i, qubits) in zip(ind, self.connections) if i]
-        j = connections.index(sys_qubit_ids)
+        connections =  [qubits for (i, qubits) in zip(ind, self.connections) if i]
+        j = connections.index(qubit_ids)
         probs = cross_talk_prob_params[j]
         
 #        i = self.random_gen.random_int([1 - self.prob_perform_cross_talk* (len(connections)-1) ] +[self.prob_perform_cross_talk] * (len(connections)-1), len(connections) )
         #x_prime = self.prob_perform_cross_talk * probs
         
-        rho = 0
+        rho = [0 for r in sys.rho]
         sys.careful_mode = False
         for cross_talk_qubits, p in zip( connections, probs):
             if cross_talk_qubits == sys_qubit_ids:
-                rho_i = rho
+                continue
             else:
-                reverse_ind = reverse_ind0 + reverse_ind1
-                self.reverse_ind.append(reverse_ind)
+                sys_cross_talk_qubits = [used_qubits.index(q) for q in cross_talk_qubits]
                 
-                for ind, rev_inds in enumerate(self.reverse_ind):
-                    for rev_ind in rev_inds:
-                        self.inds[rev_ind,0] =  ind
-                self.inds[reverse_ind1, 1] = self.inds[reverse_ind1, 1] + len(reverse_ind0)
+        
+                # ind0, i = sys.inds[sys_cross_talk_qubits[0]]
+                # ind1, j = sys.inds[sys_cross_talk_qubits[1]]
+                # if ind1 == ind0:
+                #     rho_i = sys.rho[ind1].transition_qubit(ideal_gates['cz'], (i,j))
+                rho_i = sys.rho[0].transition_qubit(ideal_gates['cz'], sys_cross_talk_qubits)
+                
+                # rho_i = self.transition_depol_err(rho_i, depol_err, cross_talk_qubits, sys_cross_talk_qubits)
+                rho_i = rho_i - sys.rho[0]
             
-
-                depol_err = self.error_operators[gate_type][cross_talk_qubits]['depol']
-                rho_i = sys.rho[0].transition_qubit(ideal_gates['cz'], cross_talk_qubits)
-                rho_i = self.transition_depol_err(rho_i, depol_err, [used_qubits.index(q)  for q in cross_talk_qubits], len(used_qubits))
-                rho_i -= sys.rho[0]
-    
-            
-            rho = rho_i * p + rho
-        sys.rho[0] = sys.rho[0] + rho
-        # if i!= j:
-        #     self.transition_depol_err(sys, gate_type, qubit_ids, connections[i])
-            
+            sys.rho[0] += rho_i * p 
+        # for i in range(len(sys.rho)):
+        #     sys.rho[i] = sys.rho[i] + rho[i]
         return sys
             
             
@@ -363,7 +358,7 @@ class Model:
     
     def calculate_log_likelihood(self,sample):
         (circuit, readout_qubits, used_qubits), exp_readout = sample
-        log_pred_readout = self._run(circuit, readout_qubits, used_qubits, self.normalize_params(self.cross_talk_probabilities))
+        log_pred_readout = jnp.log(self._run(circuit, readout_qubits, used_qubits, self.normalize_params(self.cross_talk_probabilities))+1e-8)
         return np.sum(np.array(exp_readout) * log_pred_readout)
  
         
@@ -372,11 +367,13 @@ class Model:
         
         params = self.prepare_params(params, used_qubits)
         
-        readout_probs = self._run(circuit, readout_qubits, used_qubits,  params)
+        pred_readout_probs = self._run(circuit, readout_qubits, used_qubits,  params)
+        exp_readout = exp_readout/exp_readout.sum()
+        loss = jnp.sum(exp_readout * jnp.log( exp_readout / pred_readout_probs + 1e-8) )
         # return readout_probs.sum()
-        log_pred_readout = jnp.log(readout_probs + 1e-9) #deal with prob = 0    
-        log_exp_readout = jnp.log((exp_readout/exp_readout.sum())+1e-9)
-        loss =  jnp.sum( jnp.square(log_exp_readout - log_pred_readout) )
+#        log_pred_readout = jnp.log(readout_probs + 1e-9) #deal with prob = 0    
+#        log_exp_readout = jnp.log((exp_readout/exp_readout.sum())+1e-9)
+#        loss =  jnp.sum( jnp.square(log_exp_readout - log_pred_readout) )
         # cross_talk_probs = params.at[np.arange(len(params)), np.arange(len(params))].multiply(0)#.subtract(params[np.arange(len(params)), np.arange(len(params))])
         
         return loss #+ self.regularization_fun(cross_talk_probs)

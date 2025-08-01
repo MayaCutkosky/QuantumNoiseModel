@@ -16,6 +16,10 @@ import os
 def train(model, dset, epochs = 10, verbose = True, start = 0):
     def write_data(name, val):
         filename = 'Output/' + name + '.txt'
+        if not os.path.exists(filename):
+            with open(filename, 'a') as f:
+                f.write('epoch, step, ' + name + '\n')
+            
         with open(filename, 'a') as f:
             f.write( str(epoch) + ', ' + str(i) +', ' + str(val) + '\n')
     for epoch in range(start,start + epochs):
@@ -53,12 +57,15 @@ if __name__ == '__main__':
 
     if args.use_chkpt:
         model.cross_talk_probabilities = jnp.array(np.load('Output/params_chkpt.npy'))
+        start = max([int(s.partition('_')[0]) for s in os.listdir('Output') if s[0].isdigit()])
     else:
         assert not os.path.exists('Output')
+        os.mkdir('Output')
+        start = 0
     dset = Dataset(args.dataset_file)
     dset.add_restrictions([restrict_machine('ibm_fez')])
     dset.add_restrictions([lambda x,y : len(x[0][2]) < 9 ])
-    train(model, dset, start = 22, epochs = 28)
+    train(model, dset, epochs = 50, start = start)
     
     
 
