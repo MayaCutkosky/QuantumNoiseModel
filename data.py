@@ -3,7 +3,7 @@ from qiskit.quantum_info import Kraus as qiskit_Kraus
 import itertools as it
 import numpy as np
 import warnings
-from utils import pauli, operator, kraus
+from utils import pauli, operator, kraus, JaxKraus
 
 def relaxation_error(prop, qubit, gate_length):
     '''
@@ -80,7 +80,7 @@ def get_errs_from_gate(prop, g):
         relax_gate_err = relax_gate_err.expand(qiskit_Kraus(relax_errs[q]))
     depol_err = gate_error(gate_err, relax_gate_err, len(qubits))
     if depol_err < 0 :
-        return kraus(relax_errs), 0#kraus([np.identity(2**len(qubits)).tolist()])
+        return JaxKraus(relax_errs), 0#kraus([np.identity(2**len(qubits)).tolist()])
     # gen = it.product(pauli.keys(),repeat = len(qubits))
     # gen.__next__()
     # kraus_input = []
@@ -91,7 +91,7 @@ def get_errs_from_gate(prop, g):
     #     kraus_input.append(np.sqrt(depol_err).tolist() * pauli_err)
     # kraus_input.append(np.sqrt(1-len(kraus_input)*depol_err).tolist() * np.identity(2**len(qubits)))
 
-    return kraus(relax_errs), depol_err #kraus(kraus_input)
+    return JaxKraus(relax_errs), depol_err #kraus(kraus_input)
 
 def get_readout_errs(q):
     probs = [None, None]
@@ -127,9 +127,11 @@ def process_backend(prop):
 
 import json
 import qiskit
-from qiskit import qpy
+from gate_utils import Instruction
+    
 
-class Dataset:
+
+class Dataset: 
     def __init__(self, filename):
         self.data_dir = filename.rpartition('/')[0]
         self.data_inds = None
@@ -195,7 +197,7 @@ class Dataset:
             if len(qubits) == 2:
                 if qubits[0] > qubits[1]:
                     qubits = (qubits[1], qubits[0])
-            circ.append([inst.name, qubits, inst.params])
+            circ.append(Instruction(inst.name, qubits, inst.params))
         readout_qubits = np.empty(len(measurement_gate_inds), dtype = int)
         for ind, val in measurement_gate_inds.items():
             readout_qubits[ind] = val
@@ -207,6 +209,7 @@ class Dataset:
         exp_readout = np.zeros(2**num_readout_qubits)
         exp_readout[readout_values] = list(job_measurements.values())
         return exp_readout
+    
     
     def __getitem__(self, i):
         if self.data_inds is None:
@@ -232,5 +235,7 @@ def restrict_machine(machine_name):
 
 def restrict_circuit_size(max_circuit_len, min_circuit_len = 0):
     return lambda sample, data_dict : len(sample[0][0]) <= max_circuit_len and len(sample[0][0]) >= min_circuit_len
+
+
 
 

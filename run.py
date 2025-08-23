@@ -36,9 +36,19 @@ def train(model, dset, epochs = 10, verbose = True, start = 0):
                 write_data('train_log_likelihood',  model.calculate_log_likelihood(sample))
                 np.save('Output/' + str(epoch) + '_' + str(i) + '_cross_talk_prob.npy', np.array(model.normalize_params(model.cross_talk_probabilities))  )
 
-            stdout.write('\r epoch = %d \t loss = %f \t %f' % (epoch, loss, i/len(dset) ))
+            stdout.write('\r epoch = %d \t loss = %f \t %f' % (epoch, loss, i ))
             stdout.flush()
         np.save('Output/params_chkpt', np.array(model.cross_talk_probabilities))
+
+def load_model():
+    with open('ibm_token.txt') as f:
+        ibm_token = f.read()
+    service = QiskitRuntimeService(token = ibm_token, channel = 'ibm_cloud')
+
+    backend = service.backend('ibm_fez')
+    return  Model(backend)
+
+
 
 import jax.numpy as jnp
 if __name__ == '__main__':
@@ -48,13 +58,7 @@ if __name__ == '__main__':
     parser.add_argument('--use_chkpt', action = 'store_true')
     args = parser.parse_args()
     
-    with open('ibm_token.txt') as f:
-        ibm_token = f.read()
-    service = QiskitRuntimeService(token = ibm_token, channel = 'ibm_cloud')
-
-    backend = service.backend('ibm_fez')
-    model = Model(backend)
-
+    model = load_model()
     if args.use_chkpt:
         model.cross_talk_probabilities = jnp.array(np.load('Output/params_chkpt.npy'))
         start = max([int(s.partition('_')[0]) for s in os.listdir('Output') if s[0].isdigit()])
@@ -65,7 +69,10 @@ if __name__ == '__main__':
     dset = Dataset(args.dataset_file)
     dset.add_restrictions([restrict_machine('ibm_fez')])
     dset.add_restrictions([lambda x,y : len(x[0][2]) < 9 ])
+    dset.add_restrictions([restrict_circuit_size(1500)])
     train(model, dset, epochs = 50, start = start)
+    for key, val in  model.opt_state[0]._asdict().items():
+        np.save( key + '_test.npy', val)
     
     
 

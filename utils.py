@@ -4,18 +4,18 @@ from jax.tree_util import register_pytree_node_class
 
 def operator(x, data_object = None):
     n = len(x)
-    M = Operator([n,n], buffer= np.array(x, dtype = complex), data_object=data_object)
+    if data_object =='jax':
+        M = JaxOperator( np.array(x, dtype = complex) )
+    else:
+        M = Operator([n,n], buffer= np.array(x, dtype = complex), data_object=data_object)
     return M
-def kraus(x, **kwargs):
-    M = Kraus(buffer= x, **kwargs)
+def kraus(x, data_object = None, **kwargs):
+    if data_object == 'jax':
+        M = JaxKraus(data = x)
+    else:
+        M = Kraus(buffer= x, **kwargs)
     return M
 
-def digit_ind_to_binary_inds(n):
-    return np.tile( np.arange(2**n), [1,1]).T // 2 ** (n - 1 - np.tile(np.arange(n-1,-1,-1), [1,1]) ) % 2
-
-def binary_inds_to_digit_ind(inds):
-    n = len(inds[0])
-    return np.sum(2 ** np.arange(n-1, -1, -1) * inds,axis=1)
 
 class Operator:
     def __init__(self, shape = [2,2], dtype = complex, buffer = None, data_object = None):
@@ -125,11 +125,12 @@ class Operator:
         else:
             return self._create_new(buffer = self._data // y )
 
-    def tensor(self, y):
-        if isinstance(y, Operator):
-            y_data = y._data
-        else:
-            y_data = y
+    def tensor(self, y): #currently switch to only allowing tensor of operator type objects.
+        # if isinstance(y, JaxOperator):
+        #     y_data = y._data
+        # else:
+        #     y_data = y
+        y_data = y._data
         data = self.np.kron(self._data,y_data)
         if isinstance(y, Kraus):
             return y._create_new(buffer = data)
@@ -262,12 +263,12 @@ class DensityMatrix(Operator):
         qubits.sort()
         if len(qubits) == 2:
             U0, U1 = U
-            mid_qubits = np.identity(int(2 ** int(qubits[1] - qubits[0] - 1)))
+            mid_qubits = operator( np.identity(int(2 ** int(qubits[1] - qubits[0] - 1))) )
             op = operator([[1,0],[0,0]]).tensor(mid_qubits).tensor(U0) 
             op += operator([[0,0],[0,1]]).tensor(mid_qubits).tensor(U1)
         else:
             op = U
-        op = operator(np.identity(2 ** qubits[0])).tensor(op).tensor(operator(np.identity(2 ** (self.num_qubits - qubits[-1]-1))))
+        op = operator(np.identity(2 ** qubits[0]), data_object=self.data_object).tensor(op).tensor(operator(np.identity(2 ** (self.num_qubits - qubits[-1]-1))))
         return self.transition(op)
 
 
@@ -297,38 +298,47 @@ class DensityMatrix(Operator):
         assert output.imag == 0
         return output.real[0]
 
-#hacky...
-@register_pytree_node_class
-class JaxDensityMatrix(DensityMatrix):
-    def __init__(self,buffer):
-        self.type = 'density_matrix'
-        self._data = buffer
-        self.data_object = 'jax'
-        self.np = jnp
-        self.set_attr()
+import jax
+from equinox import Module
+class JaxOperator(Operator, Module):
+    type : str
+    _data : jax.Array
+    data_object : str
+    np : type(jnp)
+    real : jax.Array
+    imag : jax.Array
+    shape : tuple
     
-    def set_attr(self):
-        
-        for attr in ['real', 'imag']:
-            setattr(self, attr, getattr(self._data, attr,0.))
-        setattr(self, 'shape', getattr(self._data, 'shape',(1,1)))
-        self.num_qubits = np.log2(self.shape[-1])
-        self.num_qubits = int(self.num_qubits)
+    def __init__(self, buffer):
+        super().__init__(buffer = buffer, data_object = 'jax')
+
+class JaxKraus(Kraus, Module):
+    type : str
+    _data : jax.Array
+    data_object : str
+    np : type(jnp)
+    real : jax.Array
+    imag : jax.Array
+    shape : tuple
     
-    def __repr__(self):
-        return "DensityMatrix({})".format(self._data)
+    def __init__(self, buffer):
+        super().__init__(buffer = buffer, data_object = 'jax')
 
-    def tree_flatten(self):
-        
-        children = (self._data,)
-        aux_data = None
-        return (children, aux_data)
+class JaxDensityMatrix(DensityMatrix, Module):
+    type : str
+    _data : jax.Array
+    num_qubits : jax.Array
+    data_object : str
+    np : type(jnp)
+    real : jax.Array
+    imag : jax.Array
+    shape : tuple
+    
+    def __init__(self, buffer):
+        super().__init__(buffer = buffer, data_object = 'jax')
 
-    @classmethod
-    def tree_unflatten(cls, aux_data, children):
-        obj = cls(*children)
-        obj.set_attr()
-        return obj
+
+
 
 def density_matrix(x, **kwargs):
     if len(np.shape(x)) == 1: # x is a state
@@ -342,23 +352,41 @@ def density_matrix(x, **kwargs):
     assert rho.shape[-1] == rho.shape[-2]
     return rho
 
-from jax import lax
-class System:
-    def __init__(self,size = None, config = None, **kwargs):
-        if config is None:
-            self.rho = []
-            self.reverse_ind = []
-            for i in range(size):
-                self.rho.append(density_matrix([[1,0],[0,0]], **kwargs))
-                self.reverse_ind.append([i])
-            self.inds = np.zeros([size,2], dtype = int)
-            self.inds[:,0] = np.arange(size).astype(int)
-            self.careful_mode = True
-            self.num_qubits = size
-        else:
-            for key, value in config.items():
-                setattr(self, key, value)
-    def transition_qubit(self,U, qubits, in_place = True, return_gradient = False):
+def digit_ind_to_binary_inds(n):
+    return np.tile( np.arange(2**n), [1,1]).T // 2 ** (n - 1 - np.tile(np.arange(n-1,-1,-1), [1,1]) ) % 2
+
+def binary_inds_to_digit_ind(inds):
+    n = len(inds[0])
+    return np.sum(2 ** np.arange(n-1, -1, -1) * inds,axis=1)
+
+
+from jax_utils import make_inverse_map
+
+
+class System(Module):
+    rho : list
+    reverse_ind : list
+    inds : jax.Array
+    num_qubits : int
+    def __init__(self,  size = None, **kwargs):
+        # self.rho = []
+        # self.reverse_ind = []
+        # for i in range(size):
+        #     self.rho.append(density_matrix([[1,0],[0,0]], **kwargs))
+        #     self.reverse_ind.append([i])
+        # self.inds = np.zeros([size,2], dtype = int)
+        # self.inds[:,0] = np.arange(size).astype(int)
+        
+        #just for now?
+        
+        self.reverse_ind = [np.arange(size)]
+        self.rho = np.zeros([2**size, 2**size])
+        
+        self.inds = np.zeros([size,2], dtype = int)
+        self.inds[:,1] = np.arange(size).astype(int)
+        self.inds = jnp.array(self.inds)
+        self.num_qubits = size
+    def transition_qubit(self,U, qubits):
         '''
         
 
@@ -368,11 +396,6 @@ class System:
             DESCRIPTION.
         qubits : TYPE
             DESCRIPTION.
-        in_place : TYPE, optional
-            Currently in_place = False is not implimented. The default is True.
-        return_gradient : TYPE, optional
-            Gradient is dictionary of values with rho as the uncompressed n by n matrix, where n is the number of qubits. The default is False.
-
         Raises
         ------
         NotImplementedError
@@ -383,22 +406,21 @@ class System:
         None.
 
         '''
-        if not in_place:
-            raise NotImplementedError()
+        
+        
         if len(qubits) == 2:
             ind0, i = self.inds[qubits[0]]
             ind1, j = self.inds[qubits[1]]
             
-            if ind0 == ind1:
+                
+            
+            if True: #ind0 == ind1: #only case currently...
                 self.rho[ind0] = self.rho[ind0].transition_qubit(U, [i,j])
                 
             else:
-                if ind0 > ind1:
-                    rho0, rho1 = self.rho.pop(ind0), self.rho.pop(ind1)
-                    reverse_ind0, reverse_ind1 = self.reverse_ind.pop(ind0), self.reverse_ind.pop(ind1)
-                else:
-                    rho1, rho0 = self.rho.pop(ind1), self.rho.pop(ind0)
-                    reverse_ind1, reverse_ind0 = self.reverse_ind.pop(ind1), self.reverse_ind.pop(ind0)
+                rho0, rho1 = self.rho.pop(ind0), self.rho.pop(ind1)
+                reverse_ind0, reverse_ind1 = self.reverse_ind.pop(ind0), self.reverse_ind.pop(ind1)
+            
                 rho = rho0.tensor(rho1)
                 
                 j = j + len(reverse_ind0)
@@ -412,6 +434,7 @@ class System:
                     for rev_ind in rev_inds:
                         self.inds[rev_ind,0] =  ind
                 self.inds[reverse_ind1, 1] = self.inds[reverse_ind1, 1] + len(reverse_ind0)
+                
             
         elif len(qubits) == 1:
             ind, i = self.inds[qubits[0]]
@@ -425,7 +448,7 @@ class System:
         '''
         for i, (rho, qubit_inds) in enumerate(zip(self.rho, self.reverse_ind)):
             U = U_array._create_new(buffer = [1])
-            for Ui in U_array[qubit_inds]:
+            for Ui in U_array[np.array(qubit_inds)]:
                 U = U.tensor(Ui)
             self.rho[i] = rho.transition(U)
             
@@ -435,12 +458,13 @@ class System:
             readout_qubits = np.arange(self.num_qubits).tolist()
         prob = 1
         binary_inds = digit_ind_to_binary_inds(len(readout_qubits))
+        readout_qubit_inv_map = make_inverse_map(readout_qubits)
         for rho, qubit_inds in zip(self.rho, self.reverse_ind):
             inds = []
             extra_qubit_inds = []
             for i, q in enumerate(qubit_inds):
                 if q in readout_qubits:
-                    inds.append(readout_qubits.index(q))
+                    inds.append( readout_qubit_inv_map[q] )
                 else: 
                     extra_qubit_inds.append(i)
             if len(extra_qubit_inds):
@@ -488,50 +512,3 @@ def softmax(x,axis = None):
     exp_x = np.exp(x)
     return exp_x / exp_x.sum(axis = axis)
 
-def find_neighboring_qubits(q, coupling_map, distance = 1, return_close_neighbors = False):
-    close_neighbors = []
-    if isinstance(q, int):
-        curr_dist_neighbors = [q]
-    else:
-        curr_dist_neighbors = q
-
-    for i in range(distance):
-        close_neighbors += list(curr_dist_neighbors)
-        next_dist_neighbors = set()
-        for q_neigh in curr_dist_neighbors:
-            for q_far_neigh in coupling_map[q_neigh]:
-                if q_far_neigh not in close_neighbors:
-                    next_dist_neighbors.add(q_far_neigh)
-        curr_dist_neighbors = next_dist_neighbors
-    if return_close_neighbors:
-        return curr_dist_neighbors, close_neighbors
-    else:
-        return curr_dist_neighbors
-
-
-def add_gate(circuit, used_qubits, coupling_map, distance = 1):
-    possible_qubits, near_qubits = find_neighboring_qubits(used_qubits, coupling_map, distance, True)
-    for q1 in np.random.permutation(list(possible_qubits)):
-        q1 = int(q1)
-        for q2 in np.random.permutation(list(coupling_map[q1])):
-            q2 = int(q2)
-            if q2 in near_qubits:
-                continue
-            if q1 > q2:
-                new_gate = ('cz',(q2,q1), None)
-            else:
-                new_gate = ('cz', (q1,q2), None)
-            break
-    circuit.insert(np.random.randint(len(circuit)), new_gate)
-    used_qubits += [q1,q2]
-    return circuit, used_qubits
-
-def add_X_gates(circuit, used_qubits, coupling_map, distance = 1):
-    possible_qubits, near_qubits = find_neighboring_qubits(used_qubits, coupling_map, distance, True)
-    q = int(np.random.choice(list(possible_qubits)))
-    ind = np.random.randint(len(circuit))
-    new_gate = ('x',(q,), None)
-    circuit.insert(ind, new_gate)
-    circuit.insert(ind, new_gate)
-    used_qubits.append(q)
-    return circuit, used_qubits

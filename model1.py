@@ -5,14 +5,16 @@ import json
 from data import process_backend
 import numpy as np
 from utils import System, ideal_gates, kraus, softmax, pauli, operator, density_matrix, JaxDensityMatrix
+from gate_utils import add_gate
 import pickle
 import itertools as it
-
+from equinox import Module
 import jax
+from jax_utils import map_qubits
 class RandomGenerator:
     def __init__(self):
         self.key = random.PRNGKey(10)
-        self.i = 20
+        self.i = 0
     def get_subkey(self):
         self.i += 1
         return random.fold_in(self.key, self.i)
@@ -31,7 +33,9 @@ class RandomGenerator:
         r = random.uniform(self.get_subkey())
         r = np.random.default_rng(self.i).uniform()
         return r > p
-        
+    def reset(self):
+        self.__init__()
+
 
 
 def tensor_prod_deriv(dC, A, B):
@@ -177,16 +181,14 @@ def f_i(sys,  x, k,k0, connections, x_prime):
         connections = sys.inds[connections].tolist()
         reverse_ind = [len(i) for i in sys.reverse_ind]
         sys.rho =  f_i_diff_fun2(sys.rho, x_prime)
-    
-
 
 def compute_prob_matrix(M): #from cursor
     n = M.shape[0]
     size = 2 ** n
 
     # Generate all possible n-bit vectors for A and B
-    A_bits = ((np.arange(size)[:, None] >> np.arange(n-1, -1, -1)) & 1).astype(np.uint8)  # (size, n)
-    B_bits = ((np.arange(size)[:, None] >> np.arange(n-1, -1, -1)) & 1).astype(np.uint8)  # (size, n)
+    A_bits = ((jnp.arange(size)[:, None] >> jnp.arange(n-1, -1, -1)) & 1).astype(np.uint8)  # (size, n)
+    B_bits = ((jnp.arange(size)[:, None] >> jnp.arange(n-1, -1, -1)) & 1).astype(np.uint8)  # (size, n)
 
     # Expand A_bits and B_bits to shape (size, size, n)
     A_expand = A_bits[:, None, :]  # (size, 1, n)
@@ -196,23 +198,29 @@ def compute_prob_matrix(M): #from cursor
     mask_A1 = (A_expand == 1)
 #    mask_A0 = ~mask_A1
 
-    prob_A1 = np.where(B_expand == 0, M[:, 0], 1 - M[:, 0])  # (1, size, n)
-    prob_A0 = np.where(B_expand == 1, M[:, 1], 1 - M[:, 1])  # (1, size, n)
+    prob_A1 = jnp.where(B_expand == 0, M[:, 0], 1 - M[:, 0])  # (1, size, n)
+    prob_A0 = jnp.where(B_expand == 1, M[:, 1], 1 - M[:, 1])  # (1, size, n)
 
-    probs = np.where(mask_A1, prob_A1, prob_A0)  # (size, size, n)
+    probs = jnp.where(mask_A1, prob_A1, prob_A0)  # (size, size, n)
 
-    M_prime = np.prod(probs, axis=2)  # (size, size)
+    M_prime = jnp.prod(probs, axis=2)  # (size, size)
 
-    return jnp.array(M_prime)
+    return M_prime
 
-
-class Model:
+random_gen = RandomGenerator()
+class Model(Module):
+    num_qubits : int
+    num_gates : int
+    connections : list
+    error_operators : dict
+    readout_err : np.array
+    cross_talk_probabilities : jax.Array
+    represented_terms : list
+    coupling_map : dict
     def __init__(self, backend = None, backend_properties = None, config = None):
-        self.circuit_calculation = 'only_used_qubits'
         if config is not None:
             self.load_config(config)
         else:
-            
             if backend_properties is None:
                 backend_properties = backend.properties()
             (
@@ -222,24 +230,9 @@ class Model:
                 self.error_operators,
                 self.readout_err,
             ) = process_backend(backend_properties)
-            self.backend = backend
             self.initialize_params()
-            
-            self.optim = optax.polyak_sgd(0.1, 
-                                          f_min = 0, 
-                                          eps = 1e-8, 
-                                          scaling= 1000. #optax.schedules.linear_schedule(1, 1e-5, 1e4)
-            )
-
-            self.opt_state = self.optim.init(self.cross_talk_probabilities)        
+                 
         self.represented_terms = ['num_qubits', 'connections', 'cross_talk_probabilities']
-        
-        self.regularization_fun = lambda p: 0#jnp.var(p,axis=0).sum() 
-        
-        self.grad_fun = value_and_grad(self._calculate_loss, argnums=2)
-        #self.grad_fn = jit(self.grad_fn, static_argnums=0)
-        
-        # self.grad_fun = value_and_grad(jit(self._calculate_loss,static_argnums = 0), argnums = 2)
         
         self.coupling_map = dict()
         for q1, q2 in self.connections:
@@ -247,6 +240,8 @@ class Model:
             self.coupling_map.setdefault(q2, set() )
             self.coupling_map[q2].add(q1)
             self.coupling_map[q1].add(q2)
+        for key in self.coupling_map:
+            self.coupling_map[key] = tuple(self.coupling_map[key])
 
     def initialize_params(self, noise1 = 0.01, noise2 = 10):
         r = np.random.rand( len(self.connections), len(self.connections)) / self.num_qubits * noise1
@@ -256,64 +251,40 @@ class Model:
     def transition_depol_err(self,sys, gate_type, qubit_ids, sys_qubit_ids):
         depol_err = self.error_operators[gate_type][qubit_ids]['depol']
         
-        if self.random_gen.boolean(depol_err):
+        if random_gen.boolean(depol_err):
             return #no error
-        depol_gates = self.random_gen.random_choice(list(it.combinations(pauli, len(sys_qubit_ids)))[1:])
+        depol_gates = random_gen.random_choice(list(it.combinations(pauli, len(sys_qubit_ids)))[1:])
         for gate, q in zip(depol_gates, sys_qubit_ids):
             sys.transition_qubit(pauli[gate], (q,))
 
         
     def _run_instruction(self, sys, instruction, used_qubits, cross_talk_prob_params):
-        gate_type, qubit_ids, params = instruction
-        if self.circuit_calculation == 'only_used_qubits':
-            sys_qubit_ids = []
-            for q in qubit_ids:
-                sys_qubit_ids.append(used_qubits.index(q))
-        else:
-            sys_qubit_ids = qubit_ids
-        if gate_type == 'rz':
-            ideal_operator = ideal_gates[gate_type](params[0])
-        else:
-            ideal_operator = ideal_gates[gate_type]
-        
-        self.error_operators[gate_type][qubit_ids]['relax'][used_qubits], None
+        sys_qubit_ids = instruction.get_sys_qubit_ids(used_qubits)
+        ideal_operator = instruction.get_operator()
+        sys.transition( self.error_operators[instruction.gate_type()][instruction.qubit_ids]['relax'][ np.array(used_qubits) ] )
         sys.transition_qubit(ideal_operator, sys_qubit_ids)
         
-        self.transition_depol_err(sys, gate_type, qubit_ids, sys_qubit_ids)
-        if len(qubit_ids) < 2:
+        self.transition_depol_err(sys, instruction.gate_type(), instruction.qubit_ids, sys_qubit_ids)
+        if len(instruction.qubit_ids) < 2:
             return sys
         #$\\rho^{(1)} = (1 - \\sum_{g' \\in G} p_{g,g'}) C_g R_T \\rho^{(0)} R_T^\\dagger C_g^{\\dagger} + \\sum_{g' \\in G}  p_{g,g'} C_{g'}C_g R_T \\rho^{(0)} R_T^\\dagger (C_gC_{g'})^{\\dagger}  $
         
-        #probabilitic method
         ind = np.isin(self.connections,used_qubits).prod(1)
         connections =  [qubits for (i, qubits) in zip(ind, self.connections) if i]
-        j = connections.index(qubit_ids)
-        probs = cross_talk_prob_params[j]
+        j = connections.index(instruction.qubit_ids)
+        probs = cross_talk_prob_params[j].at[j].set(0)
         
 #        i = self.random_gen.random_int([1 - self.prob_perform_cross_talk* (len(connections)-1) ] +[self.prob_perform_cross_talk] * (len(connections)-1), len(connections) )
         #x_prime = self.prob_perform_cross_talk * probs
         
-        rho = [0 for r in sys.rho]
-        sys.careful_mode = False
+        rho = JaxDensityMatrix(sys.rho[0])
         for cross_talk_qubits, p in zip( connections, probs):
-            if cross_talk_qubits == sys_qubit_ids:
-                continue
-            else:
-                sys_cross_talk_qubits = [used_qubits.index(q) for q in cross_talk_qubits]
-                
-        
-                # ind0, i = sys.inds[sys_cross_talk_qubits[0]]
-                # ind1, j = sys.inds[sys_cross_talk_qubits[1]]
-                # if ind1 == ind0:
-                #     rho_i = sys.rho[ind1].transition_qubit(ideal_gates['cz'], (i,j))
-                rho_i = sys.rho[0].transition_qubit(ideal_gates['cz'], sys_cross_talk_qubits)
-                
-                # rho_i = self.transition_depol_err(rho_i, depol_err, cross_talk_qubits, sys_cross_talk_qubits)
-                rho_i = rho_i - sys.rho[0]
+            sys_cross_talk_qubits = [used_qubits.index(q) for q in cross_talk_qubits]                
+            rho_i = sys.rho[0].transition_qubit(ideal_gates['cz'], sys_cross_talk_qubits)
+            rho_i = rho_i - sys.rho[0]
             
-            sys.rho[0] += rho_i * p 
-        # for i in range(len(sys.rho)):
-        #     sys.rho[i] = sys.rho[i] + rho[i]
+            rho += rho_i * p 
+        sys.rho[0] = rho
         return sys
             
             
@@ -322,11 +293,11 @@ class Model:
         return self._run(circuit, readout_qubits, used_qubits, self.prepare_params(self.cross_talk_probabilities, used_qubits))
     def _run(self, circuit, readout_qubits, used_qubits, params):
         output= 0
-        readout_err_mat = compute_prob_matrix(self.readout_err[list(readout_qubits)])
+        readout_err_mat = compute_prob_matrix(self.readout_err[readout_qubits])
 
-        readout_qubits =  [used_qubits.index(q) for q in readout_qubits]
+        readout_qubits =  map_qubits(used_qubits, readout_qubits)
         used_qubits = list(used_qubits)
-        self.random_gen = RandomGenerator()
+        random_gen.reset()
         for i in range(1):
             sys = System(len(used_qubits), data_object = 'jax')
             for i in range(len(used_qubits)-1):
@@ -334,7 +305,7 @@ class Model:
             for j, instruction in enumerate(circuit):
                 sys = self._run_instruction(sys, instruction, used_qubits, params)
             readout_probs = sys.calc_probabilities(readout_qubits)
-#            readout_probs = jnp.matmul(readout_probs, readout_err_mat)
+            readout_probs = jnp.matmul(readout_probs, readout_err_mat)
             output += readout_probs
         return output
         
@@ -348,6 +319,7 @@ class Model:
         ind = np.where(np.isin(self.connections,used_qubits).prod(1))[0]
         probs = self.normalize_params(params)[ind][:,ind]
         params = probs
+        
    #     self.prob_perform_cross_talk = 1 / 2 / len(ind)
         
 #        x0 = jnp.diag(probs)
@@ -362,14 +334,20 @@ class Model:
         return np.sum(np.array(exp_readout) * log_pred_readout)
  
         
-    def _calculate_loss(self, sample_inp, exp_readout, params):
+    def _calculate_loss(self, params, sample_inp, exp_readout):
         circuit, readout_qubits, used_qubits = sample_inp
         
         params = self.prepare_params(params, used_qubits)
+        pred_readout_probs = self._run(circuit, readout_qubits, list(used_qubits),  params)
         
-        pred_readout_probs = self._run(circuit, readout_qubits, used_qubits,  params)
+        false_circuit, used_qubits = add_gate(list(circuit), list(used_qubits), self.coupling_map)
+        
+        false_pred_readout_probs = self._run(false_circuit, readout_qubits, list(used_qubits),  params)
+        
         exp_readout = exp_readout/exp_readout.sum()
+        
         loss = jnp.sum(exp_readout * jnp.log( exp_readout / pred_readout_probs + 1e-8) )
+        loss += 10 * jax.nn.relu(jnp.sum( jnp.log( false_pred_readout_probs / pred_readout_probs +1e-8) ) )
         # return readout_probs.sum()
 #        log_pred_readout = jnp.log(readout_probs + 1e-9) #deal with prob = 0    
 #        log_exp_readout = jnp.log((exp_readout/exp_readout.sum())+1e-9)
@@ -395,17 +373,14 @@ class Model:
         loss : jnp.array
 
         '''
-        return self._calculate_loss(sample[0], sample[1], self.cross_talk_probabilities )
+        return self._calculate_loss(self.cross_talk_probabilities, sample[0], sample[1] )
 
-    def train_step(self, sample):
-        clear_caches()
-        x = sample[0]
-        circ = tuple([(inst[0], inst[1], tuple(inst[2])) for inst in x[0]])
-        x = (circ, tuple(x[1].tolist()), tuple(x[2]))
-        loss, grad = self.grad_fun(x, sample[1], self.cross_talk_probabilities )
-        updates, self.opt_state = self.optim.update( grad , self.opt_state, value = loss )
-        self.cross_talk_probabilities = optax.apply_updates(self.cross_talk_probabilities, updates)
-        return loss 
+    # def train_step(self, sample):
+    #     clear_caches()
+    #     loss, grad = self.grad_fun(sample[0], sample[1], self.cross_talk_probabilities )
+    #     updates, self.opt_state = self.optim.update( grad , self.opt_state, value = loss )
+    #     self.cross_talk_probabilities = optax.apply_updates(self.cross_talk_probabilities, updates)
+    #     return loss 
 
     def get_config(self): #Not json serializable object, but can always pickle 
         config = {
@@ -467,6 +442,8 @@ class Model:
         d['scalar']['loss'] = self.calculate_loss(sample)
         d['scalar']['log_likelihood'] = self.log_likelihood(sample)
         d['image']['cross_talk_prob'] = self.normalize_params(self.cross_talk_probabilities)
+
+
 
 import matplotlib.pyplot as plt
 def plot_cross_talk(model):
