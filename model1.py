@@ -11,6 +11,11 @@ import itertools as it
 from equinox import Module
 import jax
 from jax_utils import map_qubits
+# def map_qubits(readout_qubits, used_qubits):
+#     return [ list(used_qubits).index(q) for q in readout_qubits ]
+from utils import JaxOperator
+cz_gate = ( JaxDensityMatrix(ideal_gates['cz'][0]._data), JaxDensityMatrix(ideal_gates['cz'][1]._data) )
+
 class RandomGenerator:
     def __init__(self):
         self.key = random.PRNGKey(10)
@@ -182,6 +187,8 @@ def f_i(sys,  x, k,k0, connections, x_prime):
         reverse_ind = [len(i) for i in sys.reverse_ind]
         sys.rho =  f_i_diff_fun2(sys.rho, x_prime)
 
+    
+
 def compute_prob_matrix(M): #from cursor
     n = M.shape[0]
     size = 2 ** n
@@ -206,17 +213,17 @@ def compute_prob_matrix(M): #from cursor
     M_prime = jnp.prod(probs, axis=2)  # (size, size)
 
     return M_prime
-
+import equinox as eqx
 random_gen = RandomGenerator()
-class Model(Module):
-    num_qubits : int
-    num_gates : int
-    connections : list
-    error_operators : dict
-    readout_err : np.array
-    cross_talk_probabilities : jax.Array
-    represented_terms : list
-    coupling_map : dict
+class Model:
+    # num_qubits : int
+    # num_gates : int
+    # connections : list
+    # error_operators : dict
+    # readout_err : np.array
+    # cross_talk_probabilities : jax.Array
+    # represented_terms : list
+    # coupling_map : dict
     def __init__(self, backend = None, backend_properties = None, config = None):
         if config is not None:
             self.load_config(config)
@@ -249,62 +256,87 @@ class Model(Module):
         self.cross_talk_probabilities = jnp.array(r)
     
     def transition_depol_err(self,sys, gate_type, qubit_ids, sys_qubit_ids):
+        return
         depol_err = self.error_operators[gate_type][qubit_ids]['depol']
         
         if random_gen.boolean(depol_err):
             return #no error
         depol_gates = random_gen.random_choice(list(it.combinations(pauli, len(sys_qubit_ids)))[1:])
         for gate, q in zip(depol_gates, sys_qubit_ids):
-            sys.transition_qubit(pauli[gate], (q,))
+            sys = sys.transition_qubit(pauli[gate], (q,))
 
-        
+#    @eqx.filter_jit
     def _run_instruction(self, sys, instruction, used_qubits, cross_talk_prob_params):
         sys_qubit_ids = instruction.get_sys_qubit_ids(used_qubits)
         ideal_operator = instruction.get_operator()
-        sys.transition( self.error_operators[instruction.gate_type()][instruction.qubit_ids]['relax'][ np.array(used_qubits) ] )
-        sys.transition_qubit(ideal_operator, sys_qubit_ids)
+        sys = sys.transition( self.error_operators[instruction.gate_type()][instruction.qubit_ids]['relax'][ np.array(used_qubits) ] )
+        sys = sys.transition_qubit(ideal_operator, sys_qubit_ids)
         
         self.transition_depol_err(sys, instruction.gate_type(), instruction.qubit_ids, sys_qubit_ids)
         if len(instruction.qubit_ids) < 2:
             return sys
         #$\\rho^{(1)} = (1 - \\sum_{g' \\in G} p_{g,g'}) C_g R_T \\rho^{(0)} R_T^\\dagger C_g^{\\dagger} + \\sum_{g' \\in G}  p_{g,g'} C_{g'}C_g R_T \\rho^{(0)} R_T^\\dagger (C_gC_{g'})^{\\dagger}  $
+
+        connections_in_system = np.where( np.isin(self.connections, used_qubits).prod(1) )[0]
+        j = self.connections.index(instruction.qubit_ids)
+#        prob_mask = jnp.isin(jnp.array(self.connections),used_qubits).prod(1)
+        # j = jnp.argmax( (jnp.array(self.connections) == jnp.array( instruction.qubit_ids )).prod(1) )
         
-        ind = np.isin(self.connections,used_qubits).prod(1)
-        connections =  [qubits for (i, qubits) in zip(ind, self.connections) if i]
-        j = connections.index(instruction.qubit_ids)
         probs = cross_talk_prob_params[j].at[j].set(0)
         
-#        i = self.random_gen.random_int([1 - self.prob_perform_cross_talk* (len(connections)-1) ] +[self.prob_perform_cross_talk] * (len(connections)-1), len(connections) )
-        #x_prime = self.prob_perform_cross_talk * probs
         
-        rho = JaxDensityMatrix(sys.rho[0])
-        for cross_talk_qubits, p in zip( connections, probs):
-            sys_cross_talk_qubits = [used_qubits.index(q) for q in cross_talk_qubits]                
-            rho_i = sys.rho[0].transition_qubit(ideal_gates['cz'], sys_cross_talk_qubits)
-            rho_i = rho_i - sys.rho[0]
+        def run_cross_talk_gate(sys_cross_talk_qubits, rho):   
+            def expand_U2(qubits):
+                U = ideal_gates['cz']
+                U0, U1 = JaxOperator(U[0]._data), JaxOperator(U[1]._data)
+                mid_qubits = np.identity( 2 ** (qubits[1] - qubits[0] - 1) )
+                op = U0.tensor(mid_qubits).tensor(  np.array([[1,0],[0,0]]) ) 
+                op += U1.tensor(mid_qubits).tensor(  np.array([[0,0],[0,1]]) )
+                op = op.tensor( np.identity(2 ** qubits[0]) ).rtensor(  np.identity(2 ** (sys.num_qubits - qubits[-1]-1)) )
+                return op
             
+            def create_fun(q, fun):
+                return lambda : fun(q)
+            i = jnp.min(sys_cross_talk_qubits)
+            j = jnp.max(sys_cross_talk_qubits)
+            ind =i* rho.num_qubits - i * (i+1) // 2  + j - i - 1
+            U = jax.lax.switch(ind , [ create_fun(q, expand_U2) for q in it.combinations(range(sys.num_qubits),2)])
+
+            rho_i = rho.transition(U) - rho
+            return rho_i
+        def do_nothing(sys_cross_talk_qubits, rho):
+            return rho * 0
+        
+        rho = sys.rho * 0
+        for i in connections_in_system:
+            cross_talk_qubits = self.connections[i]
+            sys_cross_talk_qubits = map_qubits(used_qubits, cross_talk_qubits) 
+            p = probs[i]
+            rho_i = jax.lax.cond(cross_talk_qubits != instruction.qubit_ids, run_cross_talk_gate, do_nothing, sys_cross_talk_qubits, sys.rho)
             rho += rho_i * p 
-        sys.rho[0] = rho
+        sys.rho =  sys.rho + rho
+#        sys = eqx.tree_at(lambda sys: sys.rho, sys,  rho + sys.rho )
         return sys
             
             
 
     def run(self, circuit, readout_qubits, used_qubits = None) -> np.ndarray:
         return self._run(circuit, readout_qubits, used_qubits, self.prepare_params(self.cross_talk_probabilities, used_qubits))
+    
+    
     def _run(self, circuit, readout_qubits, used_qubits, params):
+        # used_qubits = jnp.array(used_qubits)
         output= 0
         readout_err_mat = compute_prob_matrix(self.readout_err[readout_qubits])
 
         readout_qubits =  map_qubits(used_qubits, readout_qubits)
-        used_qubits = list(used_qubits)
+        
         random_gen.reset()
         for i in range(1):
             sys = System(len(used_qubits), data_object = 'jax')
-            for i in range(len(used_qubits)-1):
-                sys.transition_qubit([pauli['I'], pauli['I']], (i, i+1))
             for j, instruction in enumerate(circuit):
                 sys = self._run_instruction(sys, instruction, used_qubits, params)
-            readout_probs = sys.calc_probabilities(readout_qubits)
+            readout_probs = sys.calc_probabilities(readout_qubits) #size 2**n
             readout_probs = jnp.matmul(readout_probs, readout_err_mat)
             output += readout_probs
         return output
@@ -315,9 +347,9 @@ class Model(Module):
         exp_x = jnp.exp(params).T
         return (exp_x / exp_x.sum(0)).T
     
-    def prepare_params(self, params, used_qubits):
-        ind = np.where(np.isin(self.connections,used_qubits).prod(1))[0]
-        probs = self.normalize_params(params)[ind][:,ind]
+    def prepare_params(self, params, used_qubits): 
+        # ind = np.where(np.isin(self.connections,used_qubits).prod(1))[0]
+        probs = self.normalize_params(params)
         params = probs
         
    #     self.prob_perform_cross_talk = 1 / 2 / len(ind)
@@ -336,18 +368,17 @@ class Model(Module):
         
     def _calculate_loss(self, params, sample_inp, exp_readout):
         circuit, readout_qubits, used_qubits = sample_inp
+        false_circuit, used_qubits = add_gate(list(circuit), list(used_qubits), self.coupling_map)
         
         params = self.prepare_params(params, used_qubits)
         pred_readout_probs = self._run(circuit, readout_qubits, list(used_qubits),  params)
-        
-        false_circuit, used_qubits = add_gate(list(circuit), list(used_qubits), self.coupling_map)
+        exp_readout = exp_readout/exp_readout.sum()
+        loss = jnp.sum(exp_readout * jnp.log( exp_readout / pred_readout_probs + 1e-8) )
         
         false_pred_readout_probs = self._run(false_circuit, readout_qubits, list(used_qubits),  params)
+        loss += 0.1 * jax.nn.relu(jnp.sum( jnp.log( false_pred_readout_probs / pred_readout_probs +1e-7) ) )
         
-        exp_readout = exp_readout/exp_readout.sum()
         
-        loss = jnp.sum(exp_readout * jnp.log( exp_readout / pred_readout_probs + 1e-8) )
-        loss += 10 * jax.nn.relu(jnp.sum( jnp.log( false_pred_readout_probs / pred_readout_probs +1e-8) ) )
         # return readout_probs.sum()
 #        log_pred_readout = jnp.log(readout_probs + 1e-9) #deal with prob = 0    
 #        log_exp_readout = jnp.log((exp_readout/exp_readout.sum())+1e-9)

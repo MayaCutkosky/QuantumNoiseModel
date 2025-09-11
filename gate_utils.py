@@ -10,6 +10,7 @@ from utils import JaxOperator, pauli, expi, ideal_gates
 from equinox import Module
 import jax
 import numpy as np
+
 ideal_gate_funs = [
     lambda params : JaxOperator(np.identity(2)),
     lambda params : JaxOperator(pauli['X']),
@@ -21,13 +22,15 @@ ideal_gate_funs = [
 # backend = qiskit_ibm_runtime.fake_provider.FakeFez()
 # prop = backend.properties()
 # connections = [ tuple( g.qubits) for g in  prop.gates if g.gate == 'cz'  and g.qubits[0] < g.qubits[1] ] 
-class Instruction(Module):
+class Instruction:#(Module):
     gate_id : int
     qubit_ids : tuple
     params : tuple
     def __init__(self,gate_type, qubit_ids, params, num_cz_gates = 176): #hard coded value for fez!!!
         self.gate_id = list(ideal_gates.keys()).index(gate_type)
-        self.qubit_ids = qubit_ids
+        if hasattr(qubit_ids, 'tolist'):
+            qubit_ids = qubit_ids.tolist()
+        self.qubit_ids = tuple(qubit_ids)
         self.params = params
     
     def get_operator(self):
@@ -82,6 +85,8 @@ def add_gate(circuit, used_qubits, coupling_map, distance = 1, num_gates = 1):
             if finish_loop:
                 break
         circuit.insert(np.random.randint(len(circuit)), new_gate)
+        circuit.insert(0, Instruction('x', (q1,), None))
+        circuit.insert(0, Instruction('x', (q2,), None))
         added_qubits.add(q1)
         added_qubits.add(q2)
         
